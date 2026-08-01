@@ -505,6 +505,111 @@
   // -------------------------------------------------------------------------
 
   function KanbanPage() {
+    const [activeView, setActiveView] = useState("board");
+    return h("div", { className: "hermes-kanban-shell" },
+      h("nav", { className: "hermes-kanban-view-nav", "aria-label": "DAOS workspace views" },
+        h("button", {
+          type: "button",
+          className: cn("hermes-kanban-view-tab", activeView === "board" && "hermes-kanban-view-tab--active"),
+          "aria-current": activeView === "board" ? "page" : undefined,
+          onClick: function () { setActiveView("board"); },
+        }, "Board"),
+        h("button", {
+          type: "button",
+          className: cn("hermes-kanban-view-tab", activeView === "usage" && "hermes-kanban-view-tab--active"),
+          "aria-current": activeView === "usage" ? "page" : undefined,
+          onClick: function () { setActiveView("usage"); },
+        }, "Usage"),
+      ),
+      activeView === "usage" ? h(UsagePage) : h(BoardPage),
+    );
+  }
+
+  function usageWindowText(value) {
+    if (!Array.isArray(value) || value.length === 0) return "UNAVAILABLE";
+    return value.map(function (item) {
+      return `${item.window} ${Number(item.used_percent).toFixed(0)}%`;
+    }).join(" · ");
+  }
+
+  function usageResetText(value) {
+    if (!Array.isArray(value) || value.length === 0) return "UNAVAILABLE";
+    return value.map(function (item) {
+      const parsed = new Date(item.at);
+      const display = Number.isNaN(parsed.getTime()) ? item.at : parsed.toLocaleString();
+      return `${item.window} ${display}`;
+    }).join(" · ");
+  }
+
+  function usageUpdatedText(value) {
+    if (!value || value === "UNAVAILABLE") return "UNAVAILABLE";
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString();
+  }
+
+  function UsagePage() {
+    const [snapshot, setSnapshot] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+
+    const loadUsage = useCallback(function () {
+      setLoading(true);
+      setError(null);
+      return SDK.fetchJSON(`${API}/usage`)
+        .then(function (data) { setSnapshot(data); })
+        .catch(function (err) { setError(parseApiErrorMessage(err)); })
+        .finally(function () { setLoading(false); });
+    }, []);
+
+    useEffect(function () { loadUsage(); }, [loadUsage]);
+
+    const rows = snapshot && Array.isArray(snapshot.providers) ? snapshot.providers : [];
+    return h("section", { className: "hermes-kanban-usage", "aria-labelledby": "daos-usage-title" },
+      h("header", { className: "hermes-kanban-usage-header" },
+        h("div", null,
+          h("h1", { id: "daos-usage-title", className: "hermes-kanban-usage-title" }, "Usage"),
+          h("p", { className: "hermes-kanban-usage-subtitle" },
+            "Athena 운영 판단을 위한 Provider live readback"),
+        ),
+        h(Button, { variant: "outline", size: "sm", onClick: loadUsage, disabled: loading },
+          loading ? "Refreshing…" : "Refresh"),
+      ),
+      error ? h("div", { className: "hermes-kanban-usage-error", role: "status" }, "UNAVAILABLE") : null,
+      h("div", { className: "hermes-kanban-usage-table-wrap" },
+        h("table", { className: "hermes-kanban-usage-table" },
+          h("thead", null,
+            h("tr", null,
+              h("th", null, "Provider"),
+              h("th", null, "현재 사용량"),
+              h("th", null, "Reset 시각"),
+              h("th", null, "Coach PASS/STOP"),
+              h("th", null, "Last Updated"),
+            ),
+          ),
+          h("tbody", null,
+            loading && rows.length === 0
+              ? h("tr", null, h("td", { colSpan: 5, className: "hermes-kanban-usage-empty" }, "Loading live usage…"))
+              : rows.length === 0
+                ? h("tr", null, h("td", { colSpan: 5, className: "hermes-kanban-usage-empty" }, "UNAVAILABLE"))
+                : rows.map(function (row) {
+                    const coach = row.coach || "UNAVAILABLE";
+                    return h("tr", { key: row.provider },
+                      h("td", { className: "hermes-kanban-usage-provider" }, row.provider),
+                      h("td", null, usageWindowText(row.current_usage)),
+                      h("td", null, usageResetText(row.reset_at)),
+                      h("td", null,
+                        h("span", { className: `hermes-kanban-usage-coach hermes-kanban-usage-coach--${coach.toLowerCase()}` }, coach)),
+                      h("td", null, usageUpdatedText(row.last_updated)),
+                    );
+                  }),
+          ),
+        ),
+      ),
+    );
+  }
+  // End Usage P0
+
+  function BoardPage() {
     const { t } = useI18n();
     const [board, setBoard] = useState(() => readSelectedBoard() || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]

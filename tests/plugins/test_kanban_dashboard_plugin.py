@@ -61,6 +61,34 @@ def client(kanban_home):
 
 
 # ---------------------------------------------------------------------------
+# GET /usage — DAOS P0 owner view
+# ---------------------------------------------------------------------------
+
+
+def test_usage_endpoint_returns_only_public_p0_shape(client, monkeypatch):
+    from plugins.kanban.dashboard import usage_service
+
+    expected = {
+        "available": True,
+        "providers": [
+            {
+                "provider": "Claude",
+                "current_usage": [{"window": "5h", "used_percent": 17.0}],
+                "reset_at": [{"window": "5h", "at": "2026-08-01T22:20:00Z"}],
+                "coach": "PASS",
+                "last_updated": "2026-08-01T22:01:38Z",
+            }
+        ],
+    }
+    monkeypatch.setattr(usage_service, "collect_usage_dashboard", lambda: expected)
+
+    response = client.get("/api/plugins/kanban/usage")
+
+    assert response.status_code == 200
+    assert response.json() == expected
+
+
+# ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
 
@@ -2545,3 +2573,26 @@ def test_dashboard_parent_notice_and_child_results_use_detail_links():
     assert "t.link_counts" not in detail
     assert "Child Results" in detail
     assert "props.data.child_results" in detail
+
+
+def test_dashboard_bundle_contains_usage_p0_menu_and_only_five_fields():
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    assert "function UsagePage()" in bundle
+    assert '`${API}/usage`' in bundle
+    assert '"Board"' in bundle
+    assert '"Usage"' in bundle
+    usage_section = bundle.split("function UsagePage()", 1)[1].split(
+        "// End Usage P0", 1
+    )[0]
+    for label in ("Provider", "현재 사용량", "Reset 시각", "Coach PASS/STOP", "Last Updated"):
+        assert label in usage_section
+    for excluded in ("Automatic Routing", "Statistics", "Prediction", "Cost Analysis", "Chart", "Provider Management"):
+        assert excluded not in usage_section

@@ -372,6 +372,24 @@ def _links_for(conn: sqlite3.Connection, task_id: str) -> dict[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# GET /usage — DAOS P0 operator view
+# ---------------------------------------------------------------------------
+
+
+@router.get("/usage")
+async def get_usage():
+    """Return the five-field Usage P0 view without blocking the event loop.
+
+    Provider and coach failures are represented as ``UNAVAILABLE`` by the
+    service instead of becoming HTTP errors, preserving the Rule's fail-open
+    contract for the rest of the dashboard.
+    """
+    from plugins.kanban.dashboard import usage_service
+
+    return await asyncio.to_thread(usage_service.collect_usage_dashboard)
+
+
+# ---------------------------------------------------------------------------
 # GET /board
 # ---------------------------------------------------------------------------
 
