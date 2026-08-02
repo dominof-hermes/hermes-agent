@@ -97,15 +97,81 @@ def test_board_empty(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    # All canonical columns present (triage + the rest), each empty.
+    # Owner-facing DAOS column order. Two things are being asserted at once:
+    #
+    #   * the pinned owner-decision zone (owner_confirm_required,
+    #     owner_confirmed) comes first so the owner finds it in the same place
+    #     every time, and
+    #   * internal queue states (triage/todo/scheduled) project into backlog,
+    #     and the two typed code gates (ready_for_push/ready_for_deploy)
+    #     project into owner_confirm_required, rather than each being exposed
+    #     as a second workflow vocabulary.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
-    for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
-        assert expected in names, f"missing column {expected}: {names}"
+    assert names == [
+        "owner_confirm_required",
+        "owner_confirmed",
+        "backlog",
+        "ready",
+        "running",
+        "review",
+        "integrating",
+        "done",
+        "blocked",
+    ]
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+
+def test_owner_decision_columns_are_a_projection_not_lifecycle_order(client):
+    """The OC pair is a pinned owner-decision zone, not the first two stages.
+
+    Leftmost placement is presentation. The underlying lifecycle is unchanged:
+    ``owner_confirm_required`` is where the two pre-existing typed code gates
+    project to (each keeping its own status on the row), and no status was
+    renamed or removed to make room for it.
+    """
+    from hermes_cli import kanban_db as kdb
+
+    names = [c["name"] for c in client.get("/api/plugins/kanban/board").json()["columns"]]
+
+    # The zone is exactly the first two columns, in the owner-approved order.
+    assert names[:2] == ["owner_confirm_required", "owner_confirmed"]
+    # ...and the ordinary workflow keeps its existing semantic order after it.
+    assert names[2:] == [
+        "backlog", "ready", "running", "review", "integrating", "done", "blocked",
+    ]
+    # The typed gates still exist as real statuses even though they have no
+    # column of their own — they project into the owner-decision column.
+    assert {"ready_for_push", "ready_for_deploy"} <= kdb.VALID_STATUSES
+    for gate in ("ready_for_push", "ready_for_deploy"):
+        assert kdb.owner_confirm_column(gate) == "owner_confirm_required"
+    # Backlog is still the head of the chronological workflow.
+    assert kdb.owner_confirm_column("backlog") == "backlog"
+
+
+def test_owner_decision_columns_render_at_zero_count(client):
+    """Both OC columns are always present, even with nothing waiting.
+
+    A column that disappears when empty makes the owner hunt for it; the
+    contract is that the zone is in the same place every single load.
+    """
+    payload = client.get("/api/plugins/kanban/board").json()
+    columns = {c["name"]: c for c in payload["columns"]}
+
+    for name in ("owner_confirm_required", "owner_confirmed"):
+        assert name in columns, f"{name} column missing on an empty board"
+        assert columns[name]["tasks"] == []
+
+    # The KPI strip is present and reports measured zeros, never a fabricated
+    # timestamp: no waiting cards means no oldest age at all.
+    kpi = payload["owner_confirm_kpi"]
+    assert kpi["waiting"] == 0
+    assert kpi["aged_7d"] == 0
+    assert kpi["oldest_age_seconds"] is None
+    assert kpi["oldest_label"] == ""
+    assert kpi["oldest_band"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +367,7 @@ def test_dashboard_workspace_picker_explains_persistence_contract():
 
 
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
-    """Scheduled/time-delay tasks must not be silently bucketed into todo."""
+    """Internal scheduled tasks remain visible in the owner-facing backlog."""
 
     task = client.post(
         "/api/plugins/kanban/tasks",
@@ -321,8 +387,148 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
-    assert any(t["id"] == task["id"] for t in columns["scheduled"])
-    assert not any(t["id"] == task["id"] for t in columns["todo"])
+    assert any(t["id"] == task["id"] for t in columns["backlog"])
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["backlog", "review", "ready_for_push", "integrating", "ready_for_deploy"],
+)
+def test_owner_workflow_statuses_persist_and_emit_history(client, target):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "DAOS workflow"},
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}", json={"status": target},
+    )
+
+    assert response.status_code == 200, response.text
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    assert detail["task"]["status"] == target
+    assert any(
+        event["kind"] == "status" and event["payload"] == {"status": target}
+        for event in detail["events"]
+    )
+
+
+def test_owner_deploy_gate_cannot_bypass_canonical_completion_authority(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "Deploy gate"},
+    ).json()["task"]
+    moved = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "ready_for_deploy"},
+    )
+    assert moved.status_code == 200, moved.text
+
+    completed = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "done", "summary": "Must not bypass deploy authority"},
+    )
+
+    assert completed.status_code == 403
+    current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+    assert current["status"] == "ready_for_deploy"
+
+
+@pytest.mark.parametrize(
+    ("post_execution_status", "expected_code"),
+    [("review", 200), ("ready_for_push", 403),
+     ("integrating", 200), ("ready_for_deploy", 403)],
+)
+def test_post_execution_workflow_can_fail_safe_to_blocked(
+    client, post_execution_status, expected_code
+):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "Late blocker"},
+    ).json()["task"]
+    moved = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": post_execution_status},
+    )
+    assert moved.status_code == 200, moved.text
+
+    blocked = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "blocked", "block_reason": "Gate evidence missing"},
+    )
+
+    assert blocked.status_code == expected_code, blocked.text
+    detail = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    if expected_code == 403:
+        # A typed owner gate may only fail through the owner-decision reject
+        # path (or the dedicated post-approval execution endpoint), never a
+        # generic PATCH.
+        assert detail["task"]["status"] == post_execution_status
+        assert not any(event["kind"] == "blocked" for event in detail["events"])
+    else:
+        assert detail["task"]["status"] == "blocked"
+        assert any(
+            event["kind"] == "blocked"
+            and event["payload"]["reason"] == "Gate evidence missing"
+            for event in detail["events"]
+        )
+
+
+def test_dashboard_bundle_contains_usage_p0_menu_and_only_five_fields():
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    assert "function UsagePage()" in bundle
+    assert '`${API}/usage`' in bundle
+    assert '"Board"' in bundle
+    assert '"Usage"' in bundle
+    usage_section = bundle.split("function UsagePage()", 1)[1].split(
+        "// End Usage P0", 1
+    )[0]
+    for label in ("Provider", "현재 사용량", "Reset 시각", "Coach PASS/STOP", "Last Updated"):
+        assert label in usage_section
+    for excluded in ("Automatic Routing", "Statistics", "Prediction", "Cost Analysis", "Chart", "Provider Management"):
+        assert excluded not in usage_section
+
+
+def test_dashboard_bundle_contains_owner_workflow_columns():
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    ).read_text(encoding="utf-8")
+
+    required = (
+        '"backlog"',
+        '"ready_for_push"',
+        '"integrating"',
+        '"ready_for_deploy"',
+    )
+    for status in required:
+        assert status in bundle
+
+    for principle in (
+        "DAOS 2.0 운영 Workspace",
+        "사람과 AI가 하나의 조직으로 일하는 AI Native Company",
+        '"Learn", "Execute", "Evidence", "Adapt", "Improve", "Evolve"',
+        "단순함 · 실행 · Evidence · 권한 비확대",
+        "Evolve DAOS.",
+    ):
+        assert principle in bundle
+
+    dist = Path(__file__).resolve().parents[2] / "plugins" / "kanban" / "dashboard" / "dist"
+    style = (dist / "style.css").read_text(encoding="utf-8")
+    assert 'font-family: "Pretendard GOV Variable"' in style
+    assert "#090d16" in style
+    assert "#131b2e" in style
+    assert (dist / "fonts" / "PretendardGOVVariable.woff2").stat().st_size > 0
+    assert (dist / "fonts" / "LICENSE.txt").is_file()
 
 
 def test_tenant_filter(client):
@@ -375,6 +581,18 @@ def test_board_query_param_default_overrides_current_board_pointer(client):
         for task in column["tasks"]
     }
     assert pinned_ids == {default_task["id"]}
+
+
+def test_daos_ui_filters_invalid_done_and_block_transitions():
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text(encoding="utf-8")
+
+    assert "function canMoveTaskToStatus(task, targetStatus)" in bundle
+    assert 'canMoveTasksToStatus(props.selectedTasks, "blocked")' in bundle
+    assert 'canMoveTasksToStatus(props.selectedTasks, "done")' in bundle
+    assert "canMoveTasksToStatus(selectedTasks, props.column.name)" in bundle
 
 
 def test_dashboard_select_filters_use_sdk_value_change_handler():
@@ -530,9 +748,8 @@ def test_patch_schedule_then_unblock(client):
     assert r.json()["task"]["status"] == "scheduled"
 
     columns = client.get("/api/plugins/kanban/board").json()["columns"]
-    assert "scheduled" in [c["name"] for c in columns]
-    scheduled = next(c for c in columns if c["name"] == "scheduled")
-    assert any(x["id"] == t["id"] for x in scheduled["tasks"])
+    backlog = next(c for c in columns if c["name"] == "backlog")
+    assert any(x["id"] == t["id"] for x in backlog["tasks"])
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{t['id']}",
@@ -797,7 +1014,7 @@ def test_dispatch_dry_run(client):
 # ---------------------------------------------------------------------------
 
 
-def test_create_triage_lands_in_triage_column(client):
+def test_create_triage_lands_in_owner_backlog_column(client):
     r = client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "rough idea, spec me", "triage": True},
@@ -807,9 +1024,82 @@ def test_create_triage_lands_in_triage_column(client):
     assert task["status"] == "triage"
 
     r = client.get("/api/plugins/kanban/board")
-    triage = next(c for c in r.json()["columns"] if c["name"] == "triage")
-    assert len(triage["tasks"]) == 1
-    assert triage["tasks"][0]["title"] == "rough idea, spec me"
+    backlog = next(c for c in r.json()["columns"] if c["name"] == "backlog")
+    assert len(backlog["tasks"]) == 1
+    assert backlog["tasks"][0]["title"] == "rough idea, spec me"
+
+
+def test_dashboard_backlog_create_projects_to_internal_triage():
+    """The owner BACKLOG lane must not create dispatcher-ready work."""
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text(encoding="utf-8")
+    assert 'triage: props.columnName === "backlog" || props.columnName === "triage"' in bundle
+
+
+def test_daos_board_copy_and_cards_expose_truthful_accessible_controls():
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text(encoding="utf-8")
+    assert "LIVE READ ONLY" not in bundle
+    assert "LIVE DATA" in bundle
+    assert 'setLiveStatus("reconnecting")' in bundle
+    assert 'setLiveStatus("live")' in bundle
+    assert '"aria-live": "polite"' in bundle
+    assert 'return h("article", {' in bundle
+    assert 'className: "hermes-kanban-card-open"' in bundle
+    assert 'className: "hermes-kanban-card-move"' in bundle
+    assert '"aria-label": `Move task ${t.id}`' in bundle
+    assert 'className: "hermes-kanban-stage-nav"' in bundle
+    assert "9 workflow stages" in bundle
+    assert 'props.boardSlug === "daos-2-0" ? "Managed workspace"' in bundle
+    assert "BLOCKABLE_STATUSES.has(t.status)" in bundle
+    assert "COMPLETABLE_STATUSES.has(t.status)" in bundle
+    assert "BLOCKABLE_STATUSES.has(task.status)" in bundle
+    assert "COMPLETABLE_STATUSES.has(task.status)" in bundle
+
+
+@pytest.mark.parametrize(
+    "owner_status",
+    ["backlog", "review", "ready_for_push", "integrating", "ready_for_deploy"],
+)
+def test_bulk_move_accepts_all_owner_workflow_statuses(client, owner_status):
+    tasks = [
+        client.post("/api/plugins/kanban/tasks", json={"title": f"bulk-{idx}"}).json()["task"]
+        for idx in range(2)
+    ]
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task["id"] for task in tasks], "status": owner_status},
+    )
+
+    assert response.status_code == 200
+    assert all(item["ok"] for item in response.json()["results"])
+    for task in tasks:
+        current = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()["task"]
+        assert current["status"] == owner_status
+
+
+def test_reopening_done_task_clears_completion_metadata(client):
+    task = client.post("/api/plugins/kanban/tasks", json={"title": "reopen"}).json()["task"]
+    completed = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "done", "result": "old result", "summary": "old summary"},
+    ).json()["task"]
+    assert completed["completed_at"] is not None
+    assert completed["result"] == "old result"
+
+    reopened = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "review"},
+    ).json()["task"]
+
+    assert reopened["status"] == "review"
+    assert reopened["completed_at"] is None
+    assert reopened["result"] is None
 
 
 def test_triage_task_not_promoted_to_ready(client):
@@ -821,9 +1111,9 @@ def test_triage_task_not_promoted_to_ready(client):
     # Run the dispatcher — it should NOT promote the triage task.
     client.post("/api/plugins/kanban/dispatch?dry_run=false&max=4")
     r = client.get("/api/plugins/kanban/board")
-    triage = next(c for c in r.json()["columns"] if c["name"] == "triage")
+    backlog = next(c for c in r.json()["columns"] if c["name"] == "backlog")
     ready = next(c for c in r.json()["columns"] if c["name"] == "ready")
-    assert len(triage["tasks"]) == 1
+    assert len(backlog["tasks"]) == 1
     assert len(ready["tasks"]) == 0
 
 
@@ -2440,6 +2730,93 @@ def test_dashboard_multi_move_bulk_exists():
     assert "`${API}/tasks/bulk`" in dist
 
 
+def test_dashboard_column_order_pins_owner_decision_zone_leftmost():
+    """The client's COLUMN_ORDER must match the server's BOARD_COLUMNS exactly.
+
+    Both lists drive rendering (the server buckets, the client filters the
+    per-card "Move to…" menu). If they drift, a column silently loses its move
+    target or renders out of the owner-approved order.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+    import plugins.kanban.dashboard.plugin_api as api  # noqa: PLC0415
+
+    assert api.BOARD_COLUMNS == [
+        "owner_confirm_required", "owner_confirmed",
+        "backlog", "ready", "running", "review",
+        "integrating", "done", "blocked",
+    ]
+    assert api.OWNER_DECISION_COLUMNS == ["owner_confirm_required", "owner_confirmed"]
+    # The client list, in source order, on its own two lines.
+    assert (
+        '    "owner_confirm_required", "owner_confirmed",\n'
+        '    "backlog", "ready", "running", "review",\n'
+        '    "integrating", "done", "blocked",\n'
+    ) in dist
+
+
+def test_dashboard_renders_owner_zone_label_and_divider():
+    """The pinned zone is visually delimited, and the divider sits before the
+    first non-OC column (i.e. before Backlog) rather than at a fixed index."""
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert 'const OWNER_ZONE_LABEL = "OWNER DECISION";' in js
+    assert "hermes-kanban-owner-zone-label" in js
+    assert "hermes-kanban-owner-zone-divider" in js
+    # Boundary is computed from the zone membership of the previous column,
+    # so reordering the workflow columns can't strand the divider.
+    assert (
+        "if (prev && isOwnerDecisionColumn(prev.name) && !isOwnerDecisionColumn(col.name))"
+        in js
+    )
+    # Accessible separator, not a bare decorative div.
+    assert 'role: "separator"' in js
+    assert '"aria-orientation": "vertical"' in js
+    # Styling exists in the Midnight Graphite grammar.
+    assert ".hermes-kanban-owner-zone-label" in css
+    assert ".hermes-kanban-owner-zone-divider" in css
+    assert ".hermes-kanban-column--owner-zone" in css
+
+
+def test_dashboard_owner_zone_mobile_scroll_is_preserved():
+    """Mobile keeps the OC pair first in DOM order with usable horizontal scroll.
+
+    The columns rail stays ``overflow-x: auto`` (no scroll trapping) and the
+    OC columns get ``scroll-snap-align: start`` so the first swipe position is
+    OC Required. DOM order is the same on every breakpoint — the mobile rules
+    only hide the vertical zone label, they never reorder.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+
+    assert "overflow-x: auto;" in css
+    assert ".hermes-kanban-column--owner-zone { scroll-snap-align: start; }" in css
+    # The mobile block must not contain any order/flex-direction override that
+    # would move the OC pair out of first position.
+    mobile = css.split("@media (max-width: 900px) {")[-1]
+    assert "order:" not in mobile
+    assert "row-reverse" not in mobile
+
+
+def test_dashboard_column_labels_use_oc_not_ocr():
+    """Compact English is "OC Required"/"OC Confirmed" with Korean labels.
+
+    "OCR" is refused outright: it already means Optical Character Recognition
+    in DAOS/Geumhwa, so the abbreviation must never appear in owner-facing UI.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+
+    assert 'owner_confirm_required: "OC Required"' in js
+    assert 'owner_confirmed: "OC Confirmed"' in js
+    assert 'owner_confirm_required: "대표 승인 필요"' in js
+    assert 'owner_confirmed: "대표 승인 완료"' in js
+    assert "OCR" not in js
+
+
 def test_dashboard_failed_card_highlight_class_exists():
     """Partial bulk failures must highlight failing cards."""
     repo_root = Path(__file__).resolve().parents[2]
@@ -2573,26 +2950,3 @@ def test_dashboard_parent_notice_and_child_results_use_detail_links():
     assert "t.link_counts" not in detail
     assert "Child Results" in detail
     assert "props.data.child_results" in detail
-
-
-def test_dashboard_bundle_contains_usage_p0_menu_and_only_five_fields():
-    bundle = (
-        Path(__file__).resolve().parents[2]
-        / "plugins"
-        / "kanban"
-        / "dashboard"
-        / "dist"
-        / "index.js"
-    ).read_text(encoding="utf-8")
-
-    assert "function UsagePage()" in bundle
-    assert '`${API}/usage`' in bundle
-    assert '"Board"' in bundle
-    assert '"Usage"' in bundle
-    usage_section = bundle.split("function UsagePage()", 1)[1].split(
-        "// End Usage P0", 1
-    )[0]
-    for label in ("Provider", "현재 사용량", "Reset 시각", "Coach PASS/STOP", "Last Updated"):
-        assert label in usage_section
-    for excluded in ("Automatic Routing", "Statistics", "Prediction", "Cost Analysis", "Chart", "Provider Management"):
-        assert excluded not in usage_section

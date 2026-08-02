@@ -1180,6 +1180,22 @@ def test_block_then_unblock(kanban_home):
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_repeated_late_stage_block_routes_to_triage(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="late blocker", assignee="a")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="approval issue", kind="needs_input")
+        assert kb.unblock_task(conn, t)
+        conn.execute(
+            "UPDATE tasks SET status = 'ready_for_deploy' WHERE id = ?",
+            (t,),
+        )
+        conn.commit()
+
+        assert kb.block_task(conn, t, reason="approval issue again", kind="needs_input")
+        assert kb.get_task(conn, t).status == "triage"
+
+
 def test_unblock_resets_failure_counters(kanban_home):
     """unblock_task must reset consecutive_failures and last_failure_error."""
     with kb.connect() as conn:

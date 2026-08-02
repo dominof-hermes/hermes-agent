@@ -99,8 +99,250 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "backlog", "ready", "running",
+    "blocked", "review", "ready_for_push", "integrating",
+    "ready_for_deploy", "owner_confirm_required", "owner_confirmed",
+    "done", "archived",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+
+# ---------------------------------------------------------------------------
+# Owner Confirm (DAOS Level-3 owner gate)
+# ---------------------------------------------------------------------------
+#
+# Hermes stays Product Owner and handles Level 1/2 autonomously. Only the
+# typed Level-3 actions enumerated in ``OWNER_CONFIRM_KINDS`` reach the owner.
+#
+# NAMING: the document-recognition acronym is deliberately avoided because it
+# already has a separate meaning in DAOS/Geumhwa. Compact English is
+# "OC Required" / "OC Confirmed", the Korean labels are "대표 승인 필요" /
+# "대표 승인 완료", and the native technical statuses are
+# ``owner_confirm_required`` / ``owner_confirmed``.
+#
+# STORAGE: there is no second approval ledger. ``tasks.status`` carries the
+# state and the append-only ``task_events`` table carries every request,
+# approval, rejection and hold. Nothing here adds a table or a column.
+
+# Gate type per status. ``owner_confirm_required`` is BOTH a real status (for
+# decision-class asks that have no code gate, e.g. a customer report) and the
+# name of the owner-facing column that the two pre-existing typed code gates
+# project into. Projecting rather than rewriting preserves each card's exact
+# underlying gate/destination — a ``ready_for_push`` card stays
+# ``ready_for_push`` in the DB and keeps its push semantics.
+OWNER_GATE_TYPES: dict[str, str] = {
+    "ready_for_push": "push",
+    "ready_for_deploy": "deploy",
+    "owner_confirm_required": "decision",
+}
+# Statuses that appear in the single owner-facing "OC Required" column.
+OWNER_CONFIRM_REQUIRED_STATUSES = frozenset(OWNER_GATE_TYPES)
+# Name of the owner-facing column (also a status — see above).
+OWNER_CONFIRM_REQUIRED_COLUMN = "owner_confirm_required"
+# Inert native status recorded by an approval. Deliberately absent from every
+# claim/dispatch query (``claim_task`` selects ``ready``,
+# ``claim_review_task`` selects ``review``) so no worker or dispatcher can
+# ever pick a confirmed card up, and approving never itself pushes, deploys
+# or mutates anything. Hermes performs the approved action afterwards and
+# advances the card through the existing controlled transitions.
+OWNER_CONFIRMED_STATUS = "owner_confirmed"
+
+# --- Typed eligibility allowlist -------------------------------------------
+#
+# Eligibility is a deterministic table lookup, never a subjective judgement by
+# a model. A kind that is not in this dict cannot enter OC at all.
+# ``gate_types`` pins which underlying gate an ask of that kind may sit in, so
+# e.g. a ``customer_report`` can never be smuggled in as a production push.
+OWNER_CONFIRM_KINDS: dict[str, dict] = {
+    # Product
+    "product_release":              {"category": "product",  "gate_types": ("push", "deploy")},
+    "customer_visible_change":      {"category": "product",  "gate_types": ("push", "deploy")},
+    "operating_policy_change":      {"category": "product",  "gate_types": ("decision",)},
+    # Quality
+    "benchmark_acceptance_change":  {"category": "quality",  "gate_types": ("push", "decision")},
+    "golden_query_contract_change": {"category": "quality",  "gate_types": ("push", "decision")},
+    "llm_replacement":              {"category": "quality",  "gate_types": ("push", "deploy", "decision")},
+    "embedding_replacement":        {"category": "quality",  "gate_types": ("push", "deploy", "decision")},
+    # Security
+    "permission_policy_change":     {"category": "security", "gate_types": ("push", "deploy", "decision")},
+    "download_policy_change":       {"category": "security", "gate_types": ("push", "deploy", "decision")},
+    "publication_policy_change":    {"category": "security", "gate_types": ("push", "deploy", "decision")},
+    # Business
+    "customer_report":              {"category": "business", "gate_types": ("decision",)},
+    "completion_report":            {"category": "business", "gate_types": ("decision",)},
+    "project_closure":              {"category": "business", "gate_types": ("decision",)},
+    "major_decision":               {"category": "business", "gate_types": ("decision",)},
+}
+OWNER_CONFIRM_CATEGORIES = ("product", "quality", "security", "business")
+# Explicitly NOT owner-gated. Routine benchmark execution, adding questions
+# without changing the official contract, ordinary source/test/review work and
+# any reversible L1/L2 change stay with Hermes. Listed (rather than merely
+# absent) so the exclusion is a documented, testable decision instead of an
+# oversight someone later "fixes" by widening the allowlist.
+OWNER_CONFIRM_EXCLUDED_KINDS = frozenset({
+    "benchmark_run",
+    "benchmark_question_addition",
+    "source_change",
+    "test_change",
+    "review",
+    "l1_reversible_change",
+    "l2_reversible_change",
+})
+
+# --- Artifact fingerprint ---------------------------------------------------
+#
+# Every ask must carry an artifact hash. Code asks bind a source SHA; report /
+# decision asks bind the exact document digest instead. Neither may be
+# omitted — an approval that is not bound to an exact artifact is not an
+# approval of anything.
+# EXACT lengths only. An abbreviated digest (``deadbee``) names a *prefix*,
+# and a prefix matches every object that happens to share it — so an approval
+# bound to one is not bound to a single artifact at all. V2 therefore accepts
+# only canonical full object names: a 40-hex Git SHA-1, a 64-hex Git SHA-256
+# object name, or a 64-hex SHA-256 document digest.
+OWNER_ARTIFACT_KINDS: dict[str, tuple[int, ...]] = {
+    # kind -> the exact accepted hex lengths
+    "source_sha": (40, 64),
+    "document_sha256": (64,),
+}
+# A digest that is one short token repeated (``0000…``, ``ffff…``,
+# ``deadbeefdeadbeef…``) is a placeholder somebody typed, not a measured
+# fingerprint. Real digests do not have that shape; refusing them costs
+# nothing and closes the "bind the approval to a dummy" hole.
+OWNER_ARTIFACT_PLACEHOLDER_PERIOD = 8
+_OWNER_ARTIFACT_HEX_RE = re.compile(r"\A[0-9a-f]+\Z")
+
+# --- Entry evidence ---------------------------------------------------------
+#
+# SOURCE/IMPLEMENTED + TESTED + REVIEWED must all be present and each bound to
+# the same artifact fingerprint as the card.
+OWNER_EVIDENCE_STAGES = ("implemented", "tested", "reviewed")
+# Evidence detail lives behind allowlisted references, never inline. Raw file
+# paths and URLs are refused so the event log cannot become an exfiltration or
+# secret-leak surface.
+OWNER_EVIDENCE_REF_SCHEMES = ("task", "run", "event", "attachment", "commit", "doc")
+
+# --- 30-second owner card ---------------------------------------------------
+#
+# The card the owner reads is a strict, fixed-field 30-second summary. Detail
+# stays in the allowlisted evidence refs. Each field is length-bounded and
+# scrubbed (see ``_scrub_owner_text``).
+OWNER_CARD_FIELDS: dict[str, int] = {
+    "why": 240,             # 왜 승인 필요한가
+    "impact": 240,          # 영향
+    "rollback": 240,        # Rollback
+    "recommendation": 160,  # 추천
+    "summary_30s": 320,     # 30초 요약
+}
+
+# --- Decision --------------------------------------------------------------
+OWNER_DECISIONS = ("approve", "reject", "hold")
+# Event kinds — all append-only rows in ``task_events``.
+OWNER_CONFIRM_REQUESTED_EVENT = "owner_confirm_requested"
+OWNER_CONFIRMED_EVENT = "owner_confirmed"
+OWNER_REJECTED_EVENT = "owner_rejected"
+OWNER_HOLD_EVENT = "owner_hold"
+OWNER_CONFIRM_STALE_EVENT = "owner_confirm_stale"
+# Recorded by the dedicated exact-action execution path (see
+# :func:`execute_owner_confirmed`) when Hermes reports back what it did with
+# an approval. Never written by a generic status update.
+OWNER_EXECUTION_EVENT = "owner_confirm_executed"
+# The three decision events that are the owner's actual signature. Their
+# presence makes a card undeletable: destroying them destroys the only record
+# that a Level-3 action was authorised, refused or parked.
+OWNER_DECISION_EVENTS = (
+    OWNER_CONFIRMED_EVENT, OWNER_REJECTED_EVENT, OWNER_HOLD_EVENT,
+)
+# Every owner-gate event kind. Exempt from the 30-day event GC — a request and
+# its supersede/execution records are the context that makes a decision
+# readable, so pruning them would leave an approval no one can interpret.
+OWNER_AUDIT_EVENTS = OWNER_DECISION_EVENTS + (
+    OWNER_CONFIRM_REQUESTED_EVENT, OWNER_CONFIRM_STALE_EVENT,
+    OWNER_EXECUTION_EVENT,
+)
+# Actor recorded on every owner decision. The dashboard is single-user (one
+# per-process session token — see the plugin's module docstring), NOT a
+# cryptographic per-person identity. This records the *surface* the decision
+# came from and makes no stronger claim than that.
+OWNER_CONFIRM_ACTOR = "owner_dashboard"
+# Typed block kind used when the owner rejects. Rejection is a human decision
+# the card cannot resolve on its own.
+OWNER_REJECT_BLOCK_KIND = "needs_input"
+# A request older than this is stale: the owner would be signing evidence that
+# may no longer describe reality, so it fails closed and Hermes must re-ask.
+OWNER_CONFIRM_MAX_AGE_SECONDS = 24 * 60 * 60
+# Tolerated clock skew for ``requested_at`` in the future.
+OWNER_CONFIRM_FUTURE_SKEW_SECONDS = 300
+# Aging bands for the OC KPI strip: < 3 days neutral, 3-6 amber, >= 7 red.
+# Crossing a band NEVER auto-approves or auto-rejects anything; it is a
+# visibility signal for a busy owner and nothing more.
+OWNER_CONFIRM_AGING_AMBER_DAYS = 3
+OWNER_CONFIRM_AGING_RED_DAYS = 7
+
+# Exact, closed set of fields that bind an approval to one action. The binding
+# digest is computed over exactly these, so if the artifact, destination or
+# rollback changes, every previously issued approval stops matching and the
+# card must return to OC Required.
+OWNER_CONFIRM_BINDING_FIELDS = (
+    "oc_kind", "gate_type", "artifact_kind", "artifact_sha",
+    "destination", "rollback", "requested_at",
+)
+# Everything an ``owner_confirm_requested`` payload may carry. Built from an
+# allow-list so no credential, token, env var or raw command line can reach
+# the append-only event log.
+OWNER_CONFIRM_METADATA_FIELDS = OWNER_CONFIRM_BINDING_FIELDS + (
+    "gate_status", "card", "evidence", "binding",
+)
+
+# --- Containment -----------------------------------------------------------
+#
+# The statuses the generic status surface may not move a card *out of*. An
+# approval is worth exactly as much as the weakest path that can relocate the
+# card it is attached to, so the gates and the inert confirmed status are held
+# by the dedicated owner-decision / owner-execution paths alone.
+OWNER_CONTAINED_STATUSES = frozenset(
+    OWNER_CONFIRM_REQUIRED_STATUSES | {OWNER_CONFIRMED_STATUS}
+)
+
+# --- Post-approve execution -------------------------------------------------
+#
+# An approval authorises exactly one action; performing it is a separate,
+# explicitly named step, NOT a generic status PATCH. Hermes reports back
+# through :func:`execute_owner_confirmed`, naming the same gate type,
+# artifact and binding it was approved for, and the card advances along the
+# transition that gate type — and only that gate type — implies.
+OWNER_EXECUTION_OUTCOMES = ("performed", "failed")
+OWNER_EXECUTION_TARGET_STATUS: dict[str, str] = {
+    "push": "integrating",
+    "deploy": "done",
+    "decision": "done",
+}
+# A reported failure is not a reason to advance. The card goes to typed
+# ``blocked`` so a human sees it, and the approval stays on the record.
+OWNER_EXECUTION_FAILURE_STATUS = "blocked"
+# Closed allow-list for the execution event payload — same discipline as the
+# request and decision payloads.
+OWNER_EXECUTION_PAYLOAD_FIELDS = (
+    "outcome", "oc_kind", "oc_category", "gate_type", "gate_status",
+    "artifact_kind", "artifact_sha", "destination", "rollback",
+    "binding", "actor", "executed_at", "to_status", "note",
+)
+
+
+class OwnerConfirmMetadataError(ValueError):
+    """Approval metadata/evidence is missing, malformed, mismatched or stale.
+
+    Fail-closed: the caller never gets a decision recorded out of a partially
+    valid request.
+    """
+
+
+class OwnerConfirmStateError(RuntimeError):
+    """The card is not in the exact typed owner gate the caller expected.
+
+    Raised on a compare-and-swap loss (someone moved the card between render
+    and click) and on any attempt to decide from a non-gate status.
+    """
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -3390,6 +3632,30 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _has_owner_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when a ``blocked`` card is blocked *by the owner gate*.
+
+    Two writers park a card in ``blocked`` on the Level-3 path: an owner
+    ``reject`` (``owner_rejected``) and a failed execution of an approval
+    (``owner_confirm_executed`` with ``outcome='failed'`` — the only way that
+    event coexists with a blocked status, since a performed execution moves
+    the card forward instead).
+
+    Both are decisions the owner owns. ``recompute_ready`` must not quietly
+    undo either: auto-promoting the card back to ``ready`` would hand it
+    straight to the dispatcher on the next tick and turn a rejection into
+    advice. ``unblock_task`` (which emits ``"unblocked"``) stays the explicit,
+    recorded exit, exactly as it is for a sticky worker block.
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? AND kind IN (?, ?, 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, OWNER_REJECTED_EVENT, OWNER_EXECUTION_EVENT),
+    ).fetchone()
+    return bool(row) and row["kind"] != "unblocked"
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -3437,6 +3703,11 @@ def recompute_ready(
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
+                continue
+            if cur_status == "blocked" and _has_owner_block(conn, task_id):
+                # Owner-rejected, or an approved action that failed when
+                # executed.  Same rule, stronger reason: re-queueing here
+                # would answer the owner's question for them.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -4997,7 +5268,11 @@ def block_task(
                        block_kind    = ?,
                        block_recurrences = ?
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN (
+                       'running', 'ready', 'review', 'ready_for_push',
+                       'integrating', 'ready_for_deploy',
+                       'owner_confirm_required'
+                   )
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
                 else (kind, recurrences, task_id, int(expected_run_id)),
@@ -5036,7 +5311,11 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN (
+                           'running', 'ready', 'review', 'ready_for_push',
+                           'integrating', 'ready_for_deploy',
+                           'owner_confirm_required'
+                       )
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -5051,7 +5330,11 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN (
+                           'running', 'ready', 'review', 'ready_for_push',
+                           'integrating', 'ready_for_deploy',
+                           'owner_confirm_required'
+                       )
                        AND current_run_id = ?
                     """,
                     (kind, recurrences, task_id, int(expected_run_id)),
@@ -5223,6 +5506,1103 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             {"status": new_status} if new_status != "ready" else None,
         )
         return True
+
+
+# ---------------------------------------------------------------------------
+# Owner Confirm — the DAOS Level-3 owner gate
+# ---------------------------------------------------------------------------
+#
+# Three operations, all riding on existing tables:
+#
+#   * ``request_owner_confirm`` — Hermes records WHAT it wants signed: the
+#     typed ``oc_kind``, the exact artifact fingerprint, destination,
+#     rollback, the SOURCE/TESTED/REVIEWED entry evidence and the fixed-field
+#     30-second owner card. Appended as an ``owner_confirm_requested`` event.
+#   * ``owner_decide`` — the owner's tri-state decision (approve / reject /
+#     hold), each atomic and each recording only safe fields.
+#   * ``owner_confirm_kpi`` — the OC Waiting / Oldest / >= 7 days rollup.
+#
+# None of these execute anything. Approval records authorisation for one exact
+# bound action; Hermes performs it afterwards through the existing controlled
+# transitions, and Integration → Canary → Owner-visible remains a separate
+# execution sequence with its own readback. A confirmation is never proof that
+# those later stages ran.
+
+
+def owner_confirm_column(status: str) -> str:
+    """Project a task status onto its owner-facing column name.
+
+    All three gate statuses (``ready_for_push``, ``ready_for_deploy`` and the
+    decision-class ``owner_confirm_required``) collapse into the single
+    ``owner_confirm_required`` column so the owner sees one queue, while the
+    underlying status — and therefore the exact action Hermes will perform —
+    is left untouched on the row. Every other status maps to itself.
+    """
+    if status in OWNER_CONFIRM_REQUIRED_STATUSES:
+        return OWNER_CONFIRM_REQUIRED_COLUMN
+    return status
+
+
+def owner_confirm_short_sha(artifact_sha: str) -> str:
+    """Short display form of an artifact fingerprint (git-style 12 chars)."""
+    return (artifact_sha or "")[:12]
+
+
+def is_owner_confirm_required(oc_kind: str) -> bool:
+    """Deterministic typed eligibility check — a table lookup, not a judgement.
+
+    Returns True only for a kind in :data:`OWNER_CONFIRM_KINDS`. Routine
+    benchmark runs, question additions that don't change the official
+    contract, ordinary source/test/review work and reversible L1/L2 changes
+    are not in the table and therefore never enter OC.
+    """
+    return oc_kind in OWNER_CONFIRM_KINDS
+
+
+# --- Owner-facing text: non-disclosure -------------------------------------
+#
+# The owner card and the evidence summaries are rendered in a browser and
+# stored forever in an append-only event log. Anything that identifies a
+# person, opens a session, or names a machine belongs behind an allowlisted
+# evidence handle — or nowhere. Every rule below is *shape*-based rather than
+# keyword-based wherever a keyword would fire on ordinary Korean/English
+# business prose ("암호화 정책 변경", "role of the reviewer", "Q3 목표").
+#
+# Errors raised from these rules name the field and the category only. They
+# never echo the offending text back, because the error itself is logged and
+# returned over the API — a scrubber that quotes what it caught is a leak.
+
+# Personal identifiers.
+_OWNER_TEXT_EMAIL_RE = re.compile(
+    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+"
+)
+# Korean resident registration number (주민등록번호) and the same-shaped
+# foreigner registration number. Only the separated canonical form is matched:
+# a bare 13-digit run is indistinguishable from a millisecond timestamp, and
+# refusing those would be a false positive on ordinary operational text.
+_OWNER_TEXT_RRN_RE = re.compile(r"(?<!\d)\d{6}\s*-\s*[1-8]\d{6}(?!\d)")
+_OWNER_TEXT_PHONE_RE = re.compile(
+    r"(?<![\d\-])(?:"
+    r"\+?82[\-\s.]?1[016789][\-\s.]?\d{3,4}[\-\s.]?\d{4}"      # +82 mobile
+    r"|01[016789][\-\s.]?\d{3,4}[\-\s.]?\d{4}"                  # KR mobile
+    r"|0(?:2|[3-6][1-5])[\-\s.]?\d{3,4}[\-\s.]?\d{4}"           # KR landline
+    r"|1[5-8]\d{2}[\-\s.]?\d{4}"                                # KR 15xx/16xx/18xx
+    r"|\+\d{1,3}[\-\s.]?\(?\d{2,4}\)?[\-\s.]?\d{3,4}[\-\s.]?\d{4}"  # international
+    r")(?![\d\-])"
+)
+
+# Credentials. Keyword alternatives are inherited from V1 unchanged; the new
+# entries are all token *shapes*, which cannot fire on prose.
+_OWNER_TEXT_SECRET_RE = re.compile(
+    r"(?i)(api[_-]?key|secret|passwd|password|token|bearer\s|authorization\s*:"
+    r"|-----BEGIN|xox[abprs]-|gh[pousr]_[A-Za-z0-9]{16,}|sk-[A-Za-z0-9]{16,}"
+    r"|A(?:KIA|SIA)[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{20,}"
+    r"|glpat-[A-Za-z0-9_\-]{10,}|npm_[A-Za-z0-9]{20,}"
+    r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
+    r"|ssh-(?:rsa|ed25519|dss)\s+AAAA|PRIVATE KEY)"
+)
+
+# Raw filesystem paths. Absolute POSIX paths, Windows drive/UNC paths and
+# ``~/`` expansions only — a repo-relative ``docs/adr/x.md`` is a citation,
+# not a disclosure, and a date like ``2026/08/02`` must not match.
+_OWNER_TEXT_PATH_RE = re.compile(
+    r"(?:^|[\s(\[{<=:,'\"])(?:~/|\.{1,2}/|/[A-Za-z0-9._\-]+/)"
+    r"|(?<![\w])/(?:etc|usr|var|home|root|opt|srv|tmp|proc|sys|mnt|media"
+    r"|Users|Library|Applications)(?:/|\b)"
+    r"|[A-Za-z]:\\|\\\\[A-Za-z0-9._\-]+\\"
+)
+_OWNER_TEXT_URL_RE = re.compile(r"(?i)\b(?:https?|s?ftp|ssh|file|smb|s3|gs)://")
+
+# Hosts, addresses and ports.
+_OWNER_TEXT_IP_RE = re.compile(
+    # IPv4 — a leading word character blocks "v1.2.3.4"-style version strings.
+    r"(?<![\w.])(?:(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)\.){3}"
+    r"(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)(?![\w.])"
+    # IPv6 — three or more colon groups, so clock times never match.
+    r"|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{0,4}(?![\w:])"
+)
+_OWNER_TEXT_HOSTPORT_RE = re.compile(
+    r"(?i)(?<![\w.\-])(?:localhost|[a-z0-9\-]+(?:\.[a-z0-9\-]+)+):\d{2,5}(?!\d)"
+)
+_OWNER_TEXT_HOSTNAME_RE = re.compile(
+    r"(?i)(?<![\w.\-])[a-z0-9\-]+\."
+    r"(?:internal|local|localdomain|lan|corp|intranet|svc|cluster\.local)(?![\w])"
+)
+
+# Database and account/role identity.
+# NOTE: case-insensitivity is passed as a compile flag, never as an inline
+# ``(?i)``. These patterns are built by concatenating alternatives, so an
+# inline flag would land mid-expression and Python refuses that outright.
+_OWNER_TEXT_DB_RE = re.compile(
+    r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|rediss?|amqps?"
+    r"|mssql|oracle|jdbc|odbc|clickhouse|cassandra)://"
+    r"|\b(?:hostname|dbname|database|initial\s+catalog|data\s?source"
+    r"|uid|pwd|user\s?id)\s*=\s*\S",
+    re.IGNORECASE,
+)
+_OWNER_TEXT_ROLE_RE = re.compile(
+    r"\bgrant\s+(?:all|select|insert|update|delete|usage|execute)\b"
+    r"|\b(?:db_owner|rds_?superuser|rdsadmin|sysadmin|superuser|root@)\b"
+    r"|\b(?:service[_-]?account|iam[_-]?role|assume[_-]?role)\b"
+    r"|\barn:aws[a-z\-]*:[a-z0-9\-]*:"
+    # A role *value* that looks like a system identifier (has an internal
+    # separator). "role: 운영자" and "role: owner" are prose and pass.
+    r"|\b(?:role|privilege)s?\s*[:=]\s*[\"']?[A-Za-z][A-Za-z0-9]*"
+    r"(?:[_\-][A-Za-z0-9]+)+",
+    re.IGNORECASE,
+)
+
+_OWNER_TEXT_INTERNAL_ID_RE = re.compile(r"\bt_[0-9a-f]{6,}\b")
+_OWNER_TEXT_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Ordered (category, pattern) pairs. The category is the ONLY thing that
+# reaches the error message.
+_OWNER_TEXT_DISCLOSURE_RULES: tuple[tuple[str, re.Pattern], ...] = (
+    ("an email address", _OWNER_TEXT_EMAIL_RE),
+    ("a resident registration number", _OWNER_TEXT_RRN_RE),
+    ("a phone number", _OWNER_TEXT_PHONE_RE),
+    ("a credential or secret", _OWNER_TEXT_SECRET_RE),
+    ("a raw filesystem path", _OWNER_TEXT_PATH_RE),
+    ("a URL", _OWNER_TEXT_URL_RE),
+    ("an IP address", _OWNER_TEXT_IP_RE),
+    ("a host:port endpoint", _OWNER_TEXT_HOSTPORT_RE),
+    ("an internal hostname", _OWNER_TEXT_HOSTNAME_RE),
+    ("a database connection detail", _OWNER_TEXT_DB_RE),
+    ("an account or role identifier", _OWNER_TEXT_ROLE_RE),
+    ("an internal card id", _OWNER_TEXT_INTERNAL_ID_RE),
+)
+
+
+def _scrub_owner_text(value: Any, field: str, max_len: int) -> str:
+    """Validate one owner-facing text field, fail-closed.
+
+    Enforces: present, a string, non-empty, within ``max_len`` after
+    whitespace collapsing, free of control characters, and free of every
+    disclosure category in :data:`_OWNER_TEXT_DISCLOSURE_RULES` — personal
+    identifiers, credentials, raw paths, URLs, hosts/IPs/ports, database
+    connection details, account/role identifiers and internal card ids.
+
+    Returns the normalized text. Raises a *sanitized* error that names the
+    field and the category and never repeats the rejected value.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise OwnerConfirmMetadataError(f"{field} is required")
+    text = " ".join(value.split())
+    if _OWNER_TEXT_CONTROL_RE.search(text):
+        raise OwnerConfirmMetadataError(f"{field} contains control characters")
+    if len(text) > max_len:
+        raise OwnerConfirmMetadataError(
+            f"{field} is too long (max {max_len} characters)"
+        )
+    for category, pattern in _OWNER_TEXT_DISCLOSURE_RULES:
+        if pattern.search(text):
+            raise OwnerConfirmMetadataError(
+                f"{field} contains {category}; owner cards carry no "
+                f"disclosure-restricted detail — link allowlisted evidence "
+                f"instead"
+            )
+    return text
+
+
+def _is_placeholder_digest(sha: str) -> bool:
+    """True when ``sha`` is one short token repeated to length.
+
+    Catches ``000…``, ``fff…``, ``ababab…`` and ``deadbeefdeadbeef…``. A
+    measured digest has no such period, so this never rejects a real one.
+    """
+    n = len(sha)
+    for period in range(1, min(OWNER_ARTIFACT_PLACEHOLDER_PERIOD, n) + 1):
+        if n % period == 0 and sha[:period] * (n // period) == sha:
+            return True
+    return False
+
+
+def _validate_artifact_sha(artifact_kind: Any, artifact_sha: Any) -> tuple[str, str]:
+    """Validate the artifact fingerprint against the typed gate's exact form.
+
+    Neither field may be omitted, the digest must be a canonical full object
+    name (never an abbreviation), and a placeholder value is refused outright.
+    """
+    if not isinstance(artifact_kind, str) or artifact_kind not in OWNER_ARTIFACT_KINDS:
+        raise OwnerConfirmMetadataError(
+            f"artifact_kind must be one of {sorted(OWNER_ARTIFACT_KINDS)}"
+        )
+    if not isinstance(artifact_sha, str) or not artifact_sha.strip():
+        raise OwnerConfirmMetadataError("artifact_sha is required")
+    # Normalize before every comparison so one artifact has exactly one
+    # spelling, and therefore exactly one binding digest.
+    sha = artifact_sha.strip().lower()
+    lengths = OWNER_ARTIFACT_KINDS[artifact_kind]
+    if not _OWNER_ARTIFACT_HEX_RE.fullmatch(sha) or len(sha) not in lengths:
+        raise OwnerConfirmMetadataError(
+            f"artifact_sha must be a full exact hex digest of "
+            f"{' or '.join(str(n) for n in lengths)} characters for "
+            f"artifact_kind={artifact_kind!r}; abbreviated digests are refused"
+        )
+    if _is_placeholder_digest(sha):
+        raise OwnerConfirmMetadataError(
+            "artifact_sha is a placeholder value, not a measured digest"
+        )
+    return artifact_kind, sha
+
+
+def _validate_evidence_ref(ref: Any, stage: str) -> str:
+    """Validate one allowlisted evidence reference.
+
+    Refs are ``<scheme>:<token>`` with the scheme drawn from
+    :data:`OWNER_EVIDENCE_REF_SCHEMES`. Raw paths and URLs are refused — the
+    owner card links evidence, it does not carry it.
+    """
+    if not isinstance(ref, str) or ":" not in ref:
+        raise OwnerConfirmMetadataError(
+            f"evidence.{stage}.ref must be '<scheme>:<id>' with scheme in "
+            f"{list(OWNER_EVIDENCE_REF_SCHEMES)}"
+        )
+    scheme, _, token = ref.strip().partition(":")
+    scheme = scheme.strip().lower()
+    token = token.strip()
+    if scheme not in OWNER_EVIDENCE_REF_SCHEMES:
+        raise OwnerConfirmMetadataError(
+            f"evidence.{stage}.ref scheme {scheme!r} is not allowlisted "
+            f"({list(OWNER_EVIDENCE_REF_SCHEMES)})"
+        )
+    if not token or len(token) > 128:
+        raise OwnerConfirmMetadataError(f"evidence.{stage}.ref has no usable id")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", token):
+        raise OwnerConfirmMetadataError(
+            f"evidence.{stage}.ref id must be alphanumeric/._- only"
+        )
+    return f"{scheme}:{token}"
+
+
+def _validate_evidence(evidence: Any, *, artifact_sha: str) -> dict:
+    """Validate the SOURCE/IMPLEMENTED + TESTED + REVIEWED entry evidence.
+
+    All three stages must be present and each must be bound to the *same*
+    artifact fingerprint as the card, so an approval can never inherit the
+    evidence of a different build or document.
+    """
+    if not isinstance(evidence, dict):
+        raise OwnerConfirmMetadataError(
+            f"evidence must be an object with {list(OWNER_EVIDENCE_STAGES)}"
+        )
+    unknown = set(evidence) - set(OWNER_EVIDENCE_STAGES)
+    if unknown:
+        raise OwnerConfirmMetadataError(
+            f"unknown evidence stage(s): {sorted(unknown)}"
+        )
+    out: dict[str, dict] = {}
+    for stage in OWNER_EVIDENCE_STAGES:
+        entry = evidence.get(stage)
+        if not isinstance(entry, dict):
+            raise OwnerConfirmMetadataError(f"evidence.{stage} is required")
+        entry_unknown = set(entry) - {"summary", "ref", "artifact_sha"}
+        if entry_unknown:
+            raise OwnerConfirmMetadataError(
+                f"unknown evidence.{stage} field(s): {sorted(entry_unknown)}"
+            )
+        bound = entry.get("artifact_sha")
+        if not isinstance(bound, str) or bound.strip().lower() != artifact_sha:
+            raise OwnerConfirmMetadataError(
+                f"evidence.{stage}.artifact_sha must equal the card's "
+                f"artifact_sha (exact binding)"
+            )
+        out[stage] = {
+            "summary": _scrub_owner_text(entry.get("summary"), f"evidence.{stage}.summary", 160),
+            "ref": _validate_evidence_ref(entry.get("ref"), stage),
+            "artifact_sha": artifact_sha,
+        }
+    return out
+
+
+def _validate_owner_card(card: Any) -> dict:
+    """Validate the fixed-field 30-second owner card.
+
+    Exactly the fields in :data:`OWNER_CARD_FIELDS` — 왜 승인 필요한가 (why),
+    영향 (impact), Rollback, 추천 (recommendation), 30초 요약 (summary_30s).
+    No free-form extras: detail belongs behind the evidence refs.
+    """
+    if not isinstance(card, dict):
+        raise OwnerConfirmMetadataError(
+            f"card must be an object with {list(OWNER_CARD_FIELDS)}"
+        )
+    unknown = set(card) - set(OWNER_CARD_FIELDS)
+    if unknown:
+        raise OwnerConfirmMetadataError(f"unknown card field(s): {sorted(unknown)}")
+    return {
+        field: _scrub_owner_text(card.get(field), f"card.{field}", max_len)
+        for field, max_len in OWNER_CARD_FIELDS.items()
+    }
+
+
+def owner_binding_digest(binding: dict) -> str:
+    """Stable digest over exactly :data:`OWNER_CONFIRM_BINDING_FIELDS`.
+
+    This is the whole staleness mechanism: change the artifact, destination or
+    rollback (or the kind, gate type or request time) and the digest changes,
+    so every approval issued against the old digest stops matching and the
+    card has to come back to OC Required for a fresh signature.
+    """
+    canonical = json.dumps(
+        {field: binding[field] for field in OWNER_CONFIRM_BINDING_FIELDS},
+        sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_owner_request(
+    *,
+    oc_kind: Any,
+    artifact_kind: Any,
+    artifact_sha: Any,
+    destination: Any,
+    rollback: Any,
+    requested_at: Any,
+    evidence: Any,
+    card: Any,
+    gate_status: str,
+    now: int,
+) -> dict:
+    """Validate a complete owner-gate ask, fail-closed. Returns the payload."""
+    gate_type = OWNER_GATE_TYPES.get(gate_status)
+    if gate_type is None:
+        raise OwnerConfirmStateError(
+            f"{gate_status!r} is not a typed owner gate; expected one of "
+            f"{sorted(OWNER_CONFIRM_REQUIRED_STATUSES)}"
+        )
+
+    if not isinstance(oc_kind, str) or not oc_kind.strip():
+        raise OwnerConfirmMetadataError("oc_kind is required")
+    oc_kind = oc_kind.strip()
+    if oc_kind in OWNER_CONFIRM_EXCLUDED_KINDS:
+        raise OwnerConfirmMetadataError(
+            f"{oc_kind!r} is explicitly not owner-gated; Hermes handles it "
+            f"as L1/L2 work"
+        )
+    if not is_owner_confirm_required(oc_kind):
+        raise OwnerConfirmMetadataError(
+            f"oc_kind {oc_kind!r} is not in the typed owner-confirm allowlist"
+        )
+    allowed_gates = OWNER_CONFIRM_KINDS[oc_kind]["gate_types"]
+    if gate_type not in allowed_gates:
+        raise OwnerConfirmMetadataError(
+            f"oc_kind {oc_kind!r} may only be gated as {list(allowed_gates)}, "
+            f"not {gate_type!r} ({gate_status})"
+        )
+
+    artifact_kind, artifact_sha = _validate_artifact_sha(artifact_kind, artifact_sha)
+
+    if not isinstance(destination, str) or not destination.strip():
+        raise OwnerConfirmMetadataError("destination is required")
+    destination = _scrub_owner_text(destination, "destination", 200)
+
+    rollback = _scrub_owner_text(rollback, "rollback", OWNER_CARD_FIELDS["rollback"])
+
+    # bool is an int subclass — reject it so True doesn't silently become 1.
+    if isinstance(requested_at, bool) or not isinstance(requested_at, int):
+        raise OwnerConfirmMetadataError(
+            "requested_at must be an integer unix timestamp"
+        )
+    if requested_at <= 0:
+        raise OwnerConfirmMetadataError("requested_at must be a positive timestamp")
+    if requested_at > now + OWNER_CONFIRM_FUTURE_SKEW_SECONDS:
+        raise OwnerConfirmMetadataError("requested_at is in the future")
+    if now - requested_at > OWNER_CONFIRM_MAX_AGE_SECONDS:
+        raise OwnerConfirmMetadataError(
+            "owner confirm request is stale; Hermes must re-request approval"
+        )
+
+    validated_evidence = _validate_evidence(evidence, artifact_sha=artifact_sha)
+    validated_card = _validate_owner_card(card)
+    # The card's Rollback line and the bound rollback plan are one field; keep
+    # them identical so the owner cannot read one thing and approve another.
+    if validated_card["rollback"] != rollback:
+        raise OwnerConfirmMetadataError(
+            "card.rollback must match the bound rollback summary"
+        )
+
+    payload = {
+        "oc_kind": oc_kind,
+        "oc_category": OWNER_CONFIRM_KINDS[oc_kind]["category"],
+        "gate_type": gate_type,
+        "gate_status": gate_status,
+        "artifact_kind": artifact_kind,
+        "artifact_sha": artifact_sha,
+        "destination": destination,
+        "rollback": rollback,
+        "requested_at": requested_at,
+        "evidence": validated_evidence,
+        "card": validated_card,
+    }
+    payload["binding"] = owner_binding_digest(payload)
+    return payload
+
+
+def _resolve_owner_gate_status(
+    conn: sqlite3.Connection, task_id: str, current_status: str,
+) -> str:
+    """Which typed gate an ask on this card would be recorded against.
+
+    ``owner_confirmed`` resolves back to the gate the approval came from, so a
+    supersede re-poses the question in the same lane. Anything that is not a
+    gate (or a confirmed card whose origin gate cannot be established) raises
+    :class:`OwnerConfirmStateError` — an ask has nowhere to land.
+    """
+    if current_status == OWNER_CONFIRMED_STATUS:
+        prior = _latest_owner_event_payload(conn, task_id, OWNER_CONFIRMED_EVENT)
+        gate_status = (prior or {}).get("gate_status")
+        if gate_status not in OWNER_CONFIRM_REQUIRED_STATUSES:
+            raise OwnerConfirmStateError(
+                "cannot determine which gate this confirmed card came from"
+            )
+        return gate_status
+    if current_status in OWNER_CONFIRM_REQUIRED_STATUSES:
+        return current_status
+    raise OwnerConfirmStateError(
+        f"{current_status!r} is not a typed owner gate; expected one of "
+        f"{sorted(OWNER_CONFIRM_REQUIRED_STATUSES)}"
+    )
+
+
+def validate_owner_confirm_request(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    oc_kind: Any,
+    artifact_kind: Any,
+    artifact_sha: Any,
+    destination: Any,
+    rollback: Any,
+    evidence: Any,
+    card: Any,
+    requested_at: Optional[int] = None,
+    intended_status: Optional[str] = None,
+) -> dict:
+    """Validate an owner-gate ask **without writing anything**.
+
+    Callers that combine a status move and an ask in one request (the
+    dashboard's PATCH) need to know the ask is well-formed *before* the status
+    lands, otherwise a malformed ask parks the card in a gate it cannot exit
+    and no owner-facing question was ever recorded. ``intended_status`` is the
+    status the card will be in once the caller's own status write applies;
+    when omitted the card's current status is used.
+
+    Raises the same errors :func:`request_owner_confirm` would raise for the
+    same input, and returns the payload it would record.
+    """
+    now = int(time.time())
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        raise OwnerConfirmStateError(f"task {task_id} not found")
+    current = row["status"] if intended_status is None else intended_status
+    gate_status = _resolve_owner_gate_status(conn, task_id, current)
+    return _validate_owner_request(
+        oc_kind=oc_kind,
+        artifact_kind=artifact_kind,
+        artifact_sha=artifact_sha,
+        destination=destination,
+        rollback=rollback,
+        requested_at=now if requested_at is None else requested_at,
+        evidence=evidence,
+        card=card,
+        gate_status=gate_status,
+        now=now,
+    )
+
+
+def request_owner_confirm(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    oc_kind: str,
+    artifact_kind: str,
+    artifact_sha: str,
+    destination: str,
+    rollback: str,
+    evidence: dict,
+    card: dict,
+    requested_at: Optional[int] = None,
+) -> dict:
+    """Record the Level-3 approval Hermes wants the owner to sign.
+
+    The card must already be sitting in one of the typed owner gates
+    (``ready_for_push`` / ``ready_for_deploy`` / ``owner_confirm_required``),
+    or in ``owner_confirmed`` — in which case this is a *supersede*: the
+    artifact/destination/rollback have changed, the previous approval is now
+    stale, and the card is returned to OC Required for a fresh signature (an
+    ``owner_confirm_stale`` event records why).
+
+    Appends an ``owner_confirm_requested`` event and returns the payload.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            raise OwnerConfirmStateError(f"task {task_id} not found")
+        current = row["status"]
+
+        gate_status = _resolve_owner_gate_status(conn, task_id, current)
+        superseded_binding = None
+        if current == OWNER_CONFIRMED_STATUS:
+            prior = _latest_owner_event_payload(conn, task_id, OWNER_CONFIRMED_EVENT)
+            superseded_binding = (prior or {}).get("binding")
+
+        payload = _validate_owner_request(
+            oc_kind=oc_kind,
+            artifact_kind=artifact_kind,
+            artifact_sha=artifact_sha,
+            destination=destination,
+            rollback=rollback,
+            requested_at=now if requested_at is None else requested_at,
+            evidence=evidence,
+            card=card,
+            gate_status=gate_status,
+            now=now,
+        )
+
+        if current == OWNER_CONFIRMED_STATUS:
+            if superseded_binding == payload["binding"]:
+                # Identical ask — the existing approval still covers it.
+                raise OwnerConfirmStateError(
+                    "this card is already confirmed for exactly this binding"
+                )
+            cur = conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ? AND status = ?",
+                (gate_status, task_id, OWNER_CONFIRMED_STATUS),
+            )
+            if cur.rowcount != 1:
+                raise OwnerConfirmStateError(
+                    f"task {task_id} changed status concurrently; nothing recorded"
+                )
+            _append_event(
+                conn, task_id, OWNER_CONFIRM_STALE_EVENT,
+                {
+                    "reason": "artifact_or_destination_changed",
+                    "stale_binding": superseded_binding,
+                    "binding": payload["binding"],
+                    "gate_status": gate_status,
+                    "returned_to": OWNER_CONFIRM_REQUIRED_COLUMN,
+                    "at": now,
+                },
+            )
+        _append_event(conn, task_id, OWNER_CONFIRM_REQUESTED_EVENT, payload)
+    return payload
+
+
+def _latest_owner_event_payload(
+    conn: sqlite3.Connection, task_id: str, kind: str,
+) -> Optional[dict]:
+    """Newest payload of ``kind`` for a task, or None when absent/unparseable."""
+    row = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = ? "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        parsed = json.loads(row["payload"])
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    parsed.setdefault("_event_created_at", int(row["created_at"]))
+    return parsed
+
+
+def latest_owner_confirm_request(
+    conn: sqlite3.Connection, task_id: str, *, now: Optional[int] = None,
+) -> Optional[dict]:
+    """Return the newest *usable* gate request bound to this card, else None.
+
+    "Usable" means: the card is currently in a typed owner gate, the newest
+    ``owner_confirm_requested`` event names that same gate status, and its
+    metadata, evidence and owner card all still validate (well-formed, bound
+    to the same artifact, and not stale). Anything else returns ``None`` so
+    the UI renders UNAVAILABLE and disables every decision action rather than
+    inviting a signature on evidence we cannot vouch for.
+    """
+    now = int(time.time()) if now is None else int(now)
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in OWNER_CONFIRM_REQUIRED_STATUSES:
+        return None
+    gate_status = row["status"]
+    payload = _latest_owner_event_payload(conn, task_id, OWNER_CONFIRM_REQUESTED_EVENT)
+    if payload is None or payload.get("gate_status") != gate_status:
+        return None
+    try:
+        revalidated = _validate_owner_request(
+            oc_kind=payload.get("oc_kind"),
+            artifact_kind=payload.get("artifact_kind"),
+            artifact_sha=payload.get("artifact_sha"),
+            destination=payload.get("destination"),
+            rollback=payload.get("rollback"),
+            requested_at=payload.get("requested_at"),
+            evidence=payload.get("evidence"),
+            card=payload.get("card"),
+            gate_status=gate_status,
+            now=now,
+        )
+    except (OwnerConfirmMetadataError, OwnerConfirmStateError):
+        return None
+    if revalidated["binding"] != payload.get("binding"):
+        # The stored digest doesn't describe the stored fields — treat the row
+        # as untrustworthy rather than silently re-deriving it.
+        return None
+    revalidated["requested_event_at"] = int(
+        payload.get("_event_created_at") or revalidated["requested_at"]
+    )
+    return revalidated
+
+
+def latest_owner_hold(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    """Newest hold recorded on a card, or None."""
+    return _latest_owner_event_payload(conn, task_id, OWNER_HOLD_EVENT)
+
+
+def owner_decide(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str,
+    expected_status: str,
+    binding: str,
+    reason: Optional[str] = None,
+    hold_until: Optional[int] = None,
+    actor: str = OWNER_CONFIRM_ACTOR,
+) -> dict:
+    """Atomically record the owner's tri-state decision on one typed gate.
+
+    ``decision`` is one of :data:`OWNER_DECISIONS`:
+
+      * ``approve`` — compare-and-swaps the card from ``expected_status`` to
+        the inert ``owner_confirmed`` status and appends an
+        ``owner_confirmed`` event. It executes nothing: no push, no deploy, no
+        external mutation. Hermes may then perform only the exact bound
+        action; Integration → Canary → Owner-visible stays a separate
+        execution sequence with its own readback, and this event is not proof
+        any of those stages ran.
+      * ``reject`` — records a safe reason and routes the card to typed
+        ``blocked`` (``block_kind='needs_input'``). The rejected artifact is
+        left exactly as it was — nothing is rewritten and no replacement
+        candidate is generated automatically.
+      * ``hold`` — records a safe reason and an optional ``hold_until``, and
+        leaves the card in OC Required. Held cards cannot auto-progress: no
+        dispatcher query selects a gate status, and nothing in this module
+        advances a held card on a timer.
+
+    ``binding`` must equal the digest of the currently recorded request, so a
+    decision cannot be replayed against changed artifact/destination/rollback
+    metadata, and a card that moved since render loses the compare-and-swap.
+
+    Identity caveat: the dashboard is single-user (a per-process session
+    token), not cryptographic per-person auth. ``actor`` records the surface
+    the decision came from — deliberately not presented as proof of which
+    human pressed the button.
+    """
+    if decision not in OWNER_DECISIONS:
+        raise OwnerConfirmMetadataError(
+            f"decision must be one of {list(OWNER_DECISIONS)}"
+        )
+    now = int(time.time())
+
+    reason_text = None
+    if decision in ("reject", "hold"):
+        # A rejection or a hold without a stated reason is unactionable for
+        # whoever has to respond to it.
+        reason_text = _scrub_owner_text(reason, "reason", 240)
+    elif reason is not None:
+        reason_text = _scrub_owner_text(reason, "reason", 240)
+
+    hold_until_val = None
+    if hold_until is not None:
+        if decision != "hold":
+            raise OwnerConfirmMetadataError(
+                "hold_until is only meaningful for a hold decision"
+            )
+        if isinstance(hold_until, bool) or not isinstance(hold_until, int):
+            raise OwnerConfirmMetadataError(
+                "hold_until must be an integer unix timestamp"
+            )
+        if hold_until <= now:
+            raise OwnerConfirmMetadataError("hold_until must be in the future")
+        hold_until_val = hold_until
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            raise OwnerConfirmStateError(f"task {task_id} not found")
+        current = row["status"]
+        if current != expected_status:
+            raise OwnerConfirmStateError(
+                f"task {task_id} is {current!r}, not the expected "
+                f"{expected_status!r}; reload the board and try again"
+            )
+        if current not in OWNER_CONFIRM_REQUIRED_STATUSES:
+            raise OwnerConfirmStateError(
+                f"{current!r} is not a typed owner gate; owner decisions are "
+                f"only available from {sorted(OWNER_CONFIRM_REQUIRED_STATUSES)}"
+            )
+
+        recorded = latest_owner_confirm_request(conn, task_id, now=now)
+        if recorded is None:
+            raise OwnerConfirmMetadataError(
+                "no valid owner confirm request is recorded for this card; "
+                "Hermes must record typed gate metadata and entry evidence "
+                "before it can be decided"
+            )
+        if not isinstance(binding, str) or binding != recorded["binding"]:
+            raise OwnerConfirmMetadataError(
+                "binding does not match the recorded gate request; the "
+                "artifact, destination or rollback changed — reload the card"
+            )
+
+        # Safe, allow-listed decision payload. Everything here is already
+        # validated and scrubbed; nothing else is copied through.
+        payload = {
+            "decision": decision,
+            "oc_kind": recorded["oc_kind"],
+            "oc_category": recorded["oc_category"],
+            "gate_type": recorded["gate_type"],
+            # Preserve the originating gate so Hermes knows the exact
+            # approved action even after the status moves.
+            "gate_status": expected_status,
+            "artifact_kind": recorded["artifact_kind"],
+            "artifact_sha": recorded["artifact_sha"],
+            "destination": recorded["destination"],
+            "rollback": recorded["rollback"],
+            "requested_at": recorded["requested_at"],
+            "binding": recorded["binding"],
+            "actor": actor,
+        }
+        if reason_text is not None:
+            payload["reason"] = reason_text
+
+        if decision == "approve":
+            payload["confirmed_at"] = now
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = ?",
+                (OWNER_CONFIRMED_STATUS, task_id, expected_status),
+            )
+            if cur.rowcount != 1:
+                raise OwnerConfirmStateError(
+                    f"task {task_id} changed status concurrently; nothing confirmed"
+                )
+            _append_event(conn, task_id, OWNER_CONFIRMED_EVENT, payload)
+        elif decision == "reject":
+            payload["rejected_at"] = now
+            payload["block_kind"] = OWNER_REJECT_BLOCK_KIND
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'blocked', block_kind = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = ?",
+                (OWNER_REJECT_BLOCK_KIND, task_id, expected_status),
+            )
+            if cur.rowcount != 1:
+                raise OwnerConfirmStateError(
+                    f"task {task_id} changed status concurrently; nothing rejected"
+                )
+            _append_event(conn, task_id, OWNER_REJECTED_EVENT, payload)
+        else:  # hold — status intentionally unchanged
+            payload["held_at"] = now
+            if hold_until_val is not None:
+                payload["hold_until"] = hold_until_val
+            _append_event(conn, task_id, OWNER_HOLD_EVENT, payload)
+    return payload
+
+
+def owner_confirm_kpi(
+    conn: sqlite3.Connection, *, now: Optional[int] = None,
+) -> dict:
+    """OC Waiting / Oldest / >= 7 days rollup for the dashboard header.
+
+    Ages are measured from the ``owner_confirm_requested`` event that posed
+    the card's current ask — a real recorded timestamp, never a fabricated
+    one. Cards whose timestamp cannot be established are counted as waiting
+    but contribute no age, and ``oldest_age_seconds`` stays ``None`` so the UI
+    renders an explicit placeholder instead of "0".
+
+    Crossing a band never approves or rejects anything.
+    """
+    now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status IN (%s) ORDER BY id"
+        % ",".join("?" * len(OWNER_CONFIRM_REQUIRED_STATUSES)),
+        tuple(sorted(OWNER_CONFIRM_REQUIRED_STATUSES)),
+    ).fetchall()
+
+    waiting = 0
+    aged_7d = 0
+    unknown_age = 0
+    oldest_age: Optional[int] = None
+    oldest_task_id: Optional[str] = None
+    for row in rows:
+        waiting += 1
+        payload = _latest_owner_event_payload(
+            conn, row["id"], OWNER_CONFIRM_REQUESTED_EVENT,
+        )
+        since = None
+        if payload is not None:
+            raw = payload.get("_event_created_at")
+            if raw is None:
+                raw = payload.get("requested_at")
+            try:
+                since = int(raw)
+            except (TypeError, ValueError):
+                since = None
+        if since is None or since <= 0:
+            unknown_age += 1
+            continue
+        age = max(0, now - since)
+        if age >= OWNER_CONFIRM_AGING_RED_DAYS * 86400:
+            aged_7d += 1
+        if oldest_age is None or age > oldest_age:
+            oldest_age = age
+            oldest_task_id = row["id"]
+
+    return {
+        "waiting": waiting,
+        "aged_7d": aged_7d,
+        "unknown_age": unknown_age,
+        "oldest_age_seconds": oldest_age,
+        "oldest_task_id": oldest_task_id,
+        # Empty string (not "0") when there is nothing to age — callers render
+        # a placeholder rather than a fake zero.
+        "oldest_label": _relative_age(now - oldest_age, now) if oldest_age is not None else "",
+        "oldest_band": owner_confirm_aging_band(oldest_age),
+        "measured_at": now,
+    }
+
+
+def owner_confirm_aging_band(age_seconds: Optional[int]) -> Optional[str]:
+    """Map a waiting age to its visibility band, or None when unknown.
+
+    < 3 days neutral, 3-6 days amber, >= 7 days red. Never a trigger for an
+    automatic decision.
+    """
+    if age_seconds is None:
+        return None
+    days = age_seconds // 86400
+    if days >= OWNER_CONFIRM_AGING_RED_DAYS:
+        return "red"
+    if days >= OWNER_CONFIRM_AGING_AMBER_DAYS:
+        return "amber"
+    return "neutral"
+
+
+# ---------------------------------------------------------------------------
+# Owner Confirm — containment and audit preservation
+# ---------------------------------------------------------------------------
+#
+# Two invariants, both enforced here rather than only at the API edge so no
+# future caller can route around them:
+#
+#   1. A card awaiting or holding an owner decision is not archivable. Sweeping
+#      it out of the queue would silently answer a question the owner never
+#      saw.
+#   2. A card that carries an owner decision is not destroyable. The
+#      approve/reject/hold events ARE the authorisation record; a generic
+#      delete cascade that takes them with the row erases the only proof that
+#      a Level-3 action was signed, refused or parked.
+#
+# Archiving is deliberately still allowed once a card has been decided:
+# archiving preserves every event row, and ``delete_archived_task`` refuses on
+# the same history, so archive-then-delete cannot launder the audit away.
+
+
+def has_owner_decision_history(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when an approve / reject / hold has ever been recorded here."""
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind IN (%s) LIMIT 1"
+        % ",".join("?" * len(OWNER_DECISION_EVENTS)),
+        (task_id, *OWNER_DECISION_EVENTS),
+    ).fetchone()
+    return row is not None
+
+
+def _task_status_or_none(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    return None if row is None else row["status"]
+
+
+def owner_archive_locked(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Sanitized reason why archiving must fail closed, or ``None``.
+
+    Locked while the card is in a typed gate (the owner has an unanswered
+    question) or in the inert ``owner_confirmed`` status (Hermes still owes the
+    approved action through :func:`execute_owner_confirmed`).
+    """
+    status = _task_status_or_none(conn, task_id)
+    if status in OWNER_CONFIRM_REQUIRED_STATUSES:
+        return (
+            "this card is waiting on an owner decision; decide it "
+            "(approve/reject/hold) before archiving"
+        )
+    if status == OWNER_CONFIRMED_STATUS:
+        return (
+            "this card carries an owner approval that has not been executed "
+            "yet; record the execution outcome before archiving"
+        )
+    return None
+
+
+def owner_delete_locked(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Sanitized reason why destruction must fail closed, or ``None``.
+
+    Adds owner-decision history to :func:`owner_archive_locked`: once a card
+    has been approved, rejected or held, its events are audit and outlive the
+    card's position on the board.
+    """
+    locked = owner_archive_locked(conn, task_id)
+    if locked is not None:
+        return locked
+    if has_owner_decision_history(conn, task_id):
+        return (
+            "this card carries owner-decision audit (approve/reject/hold) "
+            "that must be preserved; archive it instead of deleting"
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Owner Confirm — the exact-action execution path
+# ---------------------------------------------------------------------------
+
+
+def execute_owner_confirmed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    binding: str,
+    gate_type: str,
+    artifact_sha: str,
+    outcome: str = "performed",
+    note: Optional[str] = None,
+    actor: str = OWNER_CONFIRM_ACTOR,
+) -> dict:
+    """Record what Hermes did with an approval and advance the card.
+
+    This is the ONLY exit from ``owner_confirmed``, and it is deliberately not
+    a status write: the caller must name the same ``binding``, ``gate_type``
+    and ``artifact_sha`` the owner signed, so an approval for a push cannot be
+    spent on a deploy, on a different artifact, or twice.
+
+    ``outcome='performed'`` advances the card along the transition its gate
+    type implies (:data:`OWNER_EXECUTION_TARGET_STATUS`).
+    ``outcome='failed'`` routes it to typed ``blocked`` instead — a failed
+    execution is never a reason to move the card forward.
+
+    Recording an execution is *not* evidence that Integration → Canary →
+    Owner-visible ran; those remain separate stages with their own readback.
+    """
+    if outcome not in OWNER_EXECUTION_OUTCOMES:
+        raise OwnerConfirmMetadataError(
+            f"outcome must be one of {list(OWNER_EXECUTION_OUTCOMES)}"
+        )
+    if not isinstance(gate_type, str) or gate_type not in OWNER_EXECUTION_TARGET_STATUS:
+        raise OwnerConfirmMetadataError(
+            f"gate_type must be one of {sorted(OWNER_EXECUTION_TARGET_STATUS)}"
+        )
+    if not isinstance(binding, str) or not binding.strip():
+        raise OwnerConfirmMetadataError("binding is required")
+    if not isinstance(artifact_sha, str) or not artifact_sha.strip():
+        raise OwnerConfirmMetadataError("artifact_sha is required")
+    claimed_sha = artifact_sha.strip().lower()
+    # Validated before the txn opens so a malformed note cannot half-apply.
+    note_text = None if note is None else _scrub_owner_text(note, "note", 240)
+
+    now = int(time.time())
+    with write_txn(conn):
+        current = _task_status_or_none(conn, task_id)
+        if current is None:
+            raise OwnerConfirmStateError(f"task {task_id} not found")
+        if current != OWNER_CONFIRMED_STATUS:
+            raise OwnerConfirmStateError(
+                f"task {task_id} is {current!r}; only an {OWNER_CONFIRMED_STATUS!r} "
+                f"card has an approved action to execute"
+            )
+
+        approval = _latest_owner_event_payload(conn, task_id, OWNER_CONFIRMED_EVENT)
+        if approval is None:
+            raise OwnerConfirmStateError(
+                "no recorded approval for this card; nothing is authorised"
+            )
+        if binding != approval.get("binding"):
+            raise OwnerConfirmMetadataError(
+                "binding does not match the recorded approval; this approval "
+                "does not authorise the action being reported"
+            )
+        if gate_type != approval.get("gate_type"):
+            raise OwnerConfirmMetadataError(
+                "gate_type does not match the approved gate; an approval "
+                "authorises exactly one kind of action"
+            )
+        if claimed_sha != str(approval.get("artifact_sha") or "").strip().lower():
+            raise OwnerConfirmMetadataError(
+                "artifact_sha does not match the approved artifact"
+            )
+
+        to_status = (
+            OWNER_EXECUTION_TARGET_STATUS[gate_type] if outcome == "performed"
+            else OWNER_EXECUTION_FAILURE_STATUS
+        )
+        payload = {
+            "outcome": outcome,
+            "oc_kind": approval.get("oc_kind"),
+            "oc_category": approval.get("oc_category"),
+            "gate_type": gate_type,
+            # The gate the approval came from, preserved so the record still
+            # names the exact authorised action after the card has moved.
+            "gate_status": approval.get("gate_status"),
+            "artifact_kind": approval.get("artifact_kind"),
+            "artifact_sha": claimed_sha,
+            "destination": approval.get("destination"),
+            "rollback": approval.get("rollback"),
+            "binding": binding,
+            "actor": actor,
+            "executed_at": now,
+            "to_status": to_status,
+        }
+        if note_text is not None:
+            payload["note"] = note_text
+
+        if outcome == "performed":
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, "
+                "completed_at = CASE WHEN ? = 'done' THEN ? ELSE completed_at END, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = ?",
+                (to_status, to_status, now, task_id, OWNER_CONFIRMED_STATUS),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, block_kind = ?, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = ?",
+                (
+                    OWNER_EXECUTION_FAILURE_STATUS, OWNER_REJECT_BLOCK_KIND,
+                    task_id, OWNER_CONFIRMED_STATUS,
+                ),
+            )
+        if cur.rowcount != 1:
+            raise OwnerConfirmStateError(
+                f"task {task_id} changed status concurrently; nothing recorded"
+            )
+        _append_event(conn, task_id, OWNER_EXECUTION_EVENT, payload)
+    return payload
 
 
 def specify_triage_task(
@@ -5540,6 +6920,10 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    # Fail closed for a card the owner is still being asked about, or one
+    # holding an unexecuted approval. See ``owner_archive_locked``.
+    if owner_archive_locked(conn, task_id) is not None:
+        return False
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -5571,7 +6955,13 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     Safety guard: only archived tasks can be deleted. Active / blocked / done
     tasks must be explicitly archived first so accidental data loss requires a
     second deliberate action.
+
+    Second guard: a card carrying owner-decision audit is never deletable,
+    archived or not — otherwise archive-then-delete would be a laundering
+    route for the approval record. See ``owner_delete_locked``.
     """
+    if owner_delete_locked(conn, task_id) is not None:
+        return False
     with write_txn(conn):
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
@@ -5600,7 +6990,15 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
+
+    Fails closed the same way :func:`delete_archived_task` does: a card
+    sitting in a typed owner gate, holding an unexecuted approval, or
+    carrying any owner-decision audit is never destroyable, because the
+    approve/reject/hold events ARE the authorisation record. See
+    ``owner_delete_locked``. Ordinary cards delete exactly as before.
     """
+    if owner_delete_locked(conn, task_id) is not None:
+        return False
     with write_txn(conn):
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
@@ -8977,13 +10375,21 @@ def gc_events(
     """Delete task_events rows older than ``older_than_seconds`` for tasks
     in a terminal state (``done`` or ``archived``). Returns the number of
     rows deleted. Running / ready / blocked tasks keep their full event
-    history."""
+    history.
+
+    Owner-gate rows (:data:`OWNER_AUDIT_EVENTS` — the ask, the
+    approve/reject/hold decision, the supersede notice and the execution
+    record) are never pruned, at any age and in any status. They are the
+    authorisation record for a Level-3 action; a retention sweep that
+    silently ages them out would leave an executed approval with no proof
+    it was ever signed."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
-            (cutoff,),
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
+            "AND kind NOT IN (%s)" % ",".join("?" * len(OWNER_AUDIT_EVENTS)),
+            (cutoff, *OWNER_AUDIT_EVENTS),
         )
     return int(cur.rowcount or 0)
 

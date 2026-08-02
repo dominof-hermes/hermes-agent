@@ -117,21 +117,13 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
 
 
 def _conn(board: Optional[str] = None):
-    """Open a kanban_db connection, creating the schema on first use.
+    """Open the board DB, letting ``connect`` auto-initialize once per path.
 
-    Every handler that mutates the DB goes through this so the plugin
-    self-heals on a fresh install (no user-visible "no such table"
-    error if somebody hits POST /tasks before GET /board).
-    ``init_db`` is idempotent.
-
-    ``board`` is the query-param slug (already normalised by
-    :func:`_resolve_board`). When ``None`` the active board is used
-    via the resolution chain (env var → ``current`` file → ``default``).
+    Re-running ``init_db`` on every request is not a read-only operation: its
+    migration pass may recompute queue readiness before a rejected PATCH is
+    validated. That breaks request atomicity. ``connect`` already performs the
+    same schema initialization on first use and caches it per resolved path.
     """
-    try:
-        kanban_db.init_db(board=board)
-    except Exception as exc:
-        log.warning("kanban init_db failed: %s", exc)
     return kanban_db.connect(board=board)
 
 
@@ -142,17 +134,212 @@ def _conn(board: Optional[str] = None):
 # Columns shown by the dashboard, in left-to-right order. "archived" is
 # available via a filter toggle rather than a visible column.
 #
-# Keep this in sync with kanban_db.VALID_STATUSES.  In particular,
-# ``scheduled`` is a first-class waiting column used for time-based follow-ups;
-# if it is omitted here, the board-level fallback below mis-buckets scheduled
-# tasks into ``todo`` and makes the dashboard look like the Scheduled column
-# disappeared.
+# Owner-facing workflow. Internal queue states (triage/todo/scheduled) remain
+# valid in the Hermes kernel but are projected into BACKLOG so the dashboard
+# exposes one stable operating vocabulary rather than a second task engine.
+#
+# The same projection idea carries the DAOS Level-3 owner gate: both typed
+# gates (``ready_for_push`` and ``ready_for_deploy``) keep their own status on
+# the row — so the exact action and destination survive — but appear to the
+# owner in the single ``owner_confirm_required`` column. ``owner_confirmed``
+# is a real, inert status with its own adjacent column. See
+# ``kanban_db.owner_confirm_column``.
+# ORDER: the two owner-decision columns are pinned to the far left so a busy
+# owner finds them in the same place every time, without horizontal scrolling.
+# This is presentation only — it does NOT mean OC precedes Backlog in the
+# lifecycle. The underlying statuses, dispatcher behaviour and gate semantics
+# are untouched; see ``OWNER_DECISION_COLUMNS`` for the zone boundary the UI
+# draws its divider from.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    kanban_db.OWNER_CONFIRM_REQUIRED_COLUMN,
+    kanban_db.OWNER_CONFIRMED_STATUS,
+    "backlog", "ready", "running", "review",
+    "integrating", "done", "blocked",
 ]
+# The pinned owner-decision zone, in render order. Everything after these in
+# BOARD_COLUMNS is the ordinary chronological workflow.
+OWNER_DECISION_COLUMNS: list[str] = [
+    kanban_db.OWNER_CONFIRM_REQUIRED_COLUMN,
+    kanban_db.OWNER_CONFIRMED_STATUS,
+]
+_BACKLOG_STATUSES = {"triage", "todo", "scheduled", "backlog"}
+
+# Statuses the generic PATCH/bulk status surface is allowed to write directly.
+# ``owner_confirmed`` is deliberately absent: the only way in is the dedicated
+# POST /tasks/{id}/owner-confirm action, which validates the approval metadata
+# and compare-and-swaps. Keeping it out of this set is what stops a worker, a
+# dispatcher, a drag-drop or a bulk edit from self-confirming a Level-3 action.
+#
+# ``owner_confirm_required`` IS allowed here: parking a card in front of the
+# owner is Hermes posing a question, not answering one. A card there still
+# cannot be decided without a valid recorded request, and the decision itself
+# is unreachable from this surface.
+_DIRECT_STATUS_WRITES = {
+    "todo", "triage", "scheduled", "backlog", "review",
+    "ready_for_push", "integrating", "ready_for_deploy",
+    "owner_confirm_required",
+}
 
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+
+
+def _owner_confirm_card_state(
+    conn: sqlite3.Connection,
+    task: kanban_db.Task,
+    *,
+    now: Optional[int] = None,
+) -> Optional[dict]:
+    """Owner-gate view model for one card, or ``None`` when it isn't gated.
+
+    For a card sitting in a typed gate this returns everything the OC card and
+    the decision dialog must render: the typed ``oc_kind`` and category, gate
+    type, artifact fingerprint, destination, rollback, the fixed-field
+    30-second summary, the allowlisted evidence refs, the measured waiting age
+    and its aging band, and any standing hold.
+
+    When no valid, non-stale request is recorded, the card reports
+    ``available: False`` so the UI renders UNAVAILABLE and disables Approve /
+    Reject / Hold rather than inviting a blind signature.
+
+    For an already-confirmed card it returns the recorded approval so the
+    drawer can show exactly what Hermes was authorised to do. Confirmed cards
+    are inert here — this is display only.
+    """
+    now = int(time.time()) if now is None else int(now)
+
+    if task.status in kanban_db.OWNER_CONFIRM_REQUIRED_STATUSES:
+        base = {
+            "column": kanban_db.OWNER_CONFIRM_REQUIRED_COLUMN,
+            "gate_status": task.status,
+            "gate_type": kanban_db.OWNER_GATE_TYPES[task.status],
+            "confirmed": False,
+        }
+        meta = kanban_db.latest_owner_confirm_request(conn, task.id, now=now)
+        if meta is None:
+            base["available"] = False
+            base["waiting_since"] = None
+            base["age_seconds"] = None
+            base["age_label"] = ""
+            base["aging_band"] = None
+            return base
+        out = dict(base)
+        out.update(meta)
+        out["available"] = True
+        out["artifact_short"] = kanban_db.owner_confirm_short_sha(meta["artifact_sha"])
+        since = meta.get("requested_event_at")
+        age = max(0, now - int(since)) if since else None
+        out["waiting_since"] = int(since) if since else None
+        out["age_seconds"] = age
+        # Empty string, never "0", when the timestamp is unknown.
+        out["age_label"] = kanban_db._relative_age(since, now) if since else ""
+        out["aging_band"] = kanban_db.owner_confirm_aging_band(age)
+        hold = kanban_db.latest_owner_hold(conn, task.id)
+        if hold and hold.get("binding") == meta.get("binding"):
+            out["hold"] = {
+                "reason": hold.get("reason"),
+                "hold_until": hold.get("hold_until"),
+                "held_at": hold.get("held_at"),
+            }
+        return out
+
+    if task.status == kanban_db.OWNER_CONFIRMED_STATUS:
+        payload = kanban_db._latest_owner_event_payload(
+            conn, task.id, kanban_db.OWNER_CONFIRMED_EVENT,
+        )
+        if payload is None:
+            return {
+                "column": kanban_db.OWNER_CONFIRMED_STATUS,
+                "available": False,
+                "confirmed": True,
+            }
+        out = {
+            "column": kanban_db.OWNER_CONFIRMED_STATUS,
+            "available": True,
+            "confirmed": True,
+            "artifact_short": kanban_db.owner_confirm_short_sha(
+                str(payload.get("artifact_sha") or "")
+            ),
+        }
+        out.update(payload)
+        out.pop("_event_created_at", None)
+        return out
+
+    return None
+
+
+# Fields Hermes may send when posing an owner gate ask. Closed set — nothing
+# outside this allow-list reaches the append-only event log.
+_OWNER_GATE_REQUEST_FIELDS = (
+    "oc_kind", "artifact_kind", "artifact_sha", "destination",
+    "rollback", "requested_at", "evidence", "card",
+)
+
+
+def _record_owner_gate_request(
+    conn: sqlite3.Connection, task_id: str, owner_gate: Any,
+) -> dict:
+    """Validate + record one ``owner_confirm_requested`` ask."""
+    if not isinstance(owner_gate, dict):
+        raise HTTPException(status_code=400, detail="owner_gate must be an object")
+    unknown = set(owner_gate) - set(_OWNER_GATE_REQUEST_FIELDS)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown owner_gate field(s): {sorted(unknown)}",
+        )
+    try:
+        return kanban_db.request_owner_confirm(
+            conn, task_id,
+            oc_kind=owner_gate.get("oc_kind"),
+            artifact_kind=owner_gate.get("artifact_kind"),
+            artifact_sha=owner_gate.get("artifact_sha"),
+            destination=owner_gate.get("destination"),
+            rollback=owner_gate.get("rollback"),
+            evidence=owner_gate.get("evidence"),
+            card=owner_gate.get("card"),
+            requested_at=owner_gate.get("requested_at"),
+        )
+    except kanban_db.OwnerConfirmMetadataError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except kanban_db.OwnerConfirmStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+def _validate_owner_gate_request(
+    conn: sqlite3.Connection,
+    task_id: str,
+    owner_gate: Any,
+    *,
+    intended_status: Optional[str],
+) -> dict:
+    """Validate one owner ask without mutating task state or events."""
+    if not isinstance(owner_gate, dict):
+        raise HTTPException(status_code=400, detail="owner_gate must be an object")
+    unknown = set(owner_gate) - set(_OWNER_GATE_REQUEST_FIELDS)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown owner_gate field(s): {sorted(unknown)}",
+        )
+    try:
+        return kanban_db.validate_owner_confirm_request(
+            conn,
+            task_id,
+            oc_kind=owner_gate.get("oc_kind"),
+            artifact_kind=owner_gate.get("artifact_kind"),
+            artifact_sha=owner_gate.get("artifact_sha"),
+            destination=owner_gate.get("destination"),
+            rollback=owner_gate.get("rollback"),
+            evidence=owner_gate.get("evidence"),
+            card=owner_gate.get("card"),
+            requested_at=owner_gate.get("requested_at"),
+            intended_status=intended_status,
+        )
+    except kanban_db.OwnerConfirmMetadataError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except kanban_db.OwnerConfirmStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 def _task_dict(
@@ -493,7 +680,15 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
+            oc = _owner_confirm_card_state(conn, t)
+            if oc is not None:
+                d["owner_confirm"] = oc
+            col = (
+                "backlog" if t.status in _BACKLOG_STATUSES
+                else kanban_db.owner_confirm_column(t.status)
+            )
+            if col not in columns:
+                col = "backlog"
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -521,6 +716,9 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
+            # OC Waiting / Oldest / >= 7 days strip. Measured from recorded
+            # request events; never a synthesised zero.
+            "owner_confirm_kpi": kanban_db.owner_confirm_kpi(conn),
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }
@@ -586,6 +784,9 @@ def get_task(
         if diag_list:
             task_d["diagnostics"] = diag_list
             task_d["warnings"] = _warnings_summary_from_diagnostics(diag_list)
+        oc = _owner_confirm_card_state(conn, task)
+        if oc is not None:
+            task_d["owner_confirm"] = oc
         return {
             "task": task_d,
             "comments": [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)],
@@ -833,6 +1034,12 @@ class UpdateTaskBody(BaseModel):
     # complete --summary ... --metadata ...``.
     summary: Optional[str] = None
     metadata: Optional[dict] = None
+    # Level-3 gate request. Sent by Hermes (never by the owner's confirm
+    # action) when it parks a card in ``ready_for_push``/``ready_for_deploy``
+    # and wants the owner to sign a specific artifact + destination. Recorded
+    # as an append-only ``owner_confirm_requested`` event; see
+    # ``kanban_db.request_owner_confirm``.
+    owner_gate: Optional[dict] = None
 
 
 @router.patch("/tasks/{task_id}")
@@ -843,6 +1050,71 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+
+        # Validate the complete request before the first mutation. A malformed
+        # owner ask must not leave a card parked in a gate with no valid
+        # question for the owner, and invalid sibling fields must not land.
+        if payload.title is not None and not payload.title.strip():
+            raise HTTPException(status_code=400, detail="title cannot be empty")
+        if payload.status is not None:
+            known_statuses = {
+                "done", "blocked", "scheduled", "ready", "archived", "running",
+                kanban_db.OWNER_CONFIRMED_STATUS,
+                *_DIRECT_STATUS_WRITES,
+            }
+            if payload.status not in known_statuses:
+                raise HTTPException(
+                    status_code=400, detail=f"unknown status: {payload.status}"
+                )
+        if payload.owner_gate is not None:
+            _validate_owner_gate_request(
+                conn,
+                task_id,
+                payload.owner_gate,
+                intended_status=payload.status or task.status,
+            )
+
+        # --- Owner Confirm containment -----------------------------------
+        # The generic status surface must never be an approval path, in
+        # either direction:
+        #   * INTO ``owner_confirmed`` — that belongs to the dedicated,
+        #     evidence-validating, compare-and-swapping owner-decision action
+        #     alone. Without this, any drag-drop, bulk edit, worker or
+        #     dispatcher holding the session token could self-approve a
+        #     Level-3 action.
+        #   * OUT OF ``owner_confirmed`` — a confirmed card is inert until
+        #     Hermes performs the approved action and advances it through the
+        #     existing controlled kanban transitions (complete/block/CLI), not
+        #     through a dashboard status write.
+        if payload.status is not None:
+            if payload.status == kanban_db.OWNER_CONFIRMED_STATUS:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "status 'owner_confirmed' cannot be set through the "
+                        "generic status API; use POST "
+                        f"/tasks/{task_id}/owner-decision"
+                    ),
+                )
+            if (
+                task.status in kanban_db.OWNER_CONTAINED_STATUSES
+                and payload.status != task.status
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "owner-gated cards cannot leave their gate through the "
+                        "generic status API"
+                    ),
+                )
+            if task.status == kanban_db.OWNER_CONFIRMED_STATUS:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "owner-confirmed cards are inert here; Hermes advances "
+                        "them through the existing controlled transitions"
+                    ),
+                )
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
@@ -885,7 +1157,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=400,
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
                 )
-            elif s in ("todo", "triage", "scheduled"):
+            elif s in _DIRECT_STATUS_WRITES:
                 ok = _set_status_direct(conn, task_id, s)
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
@@ -911,6 +1183,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=409,
                     detail=f"status transition to {s!r} not valid from current state",
                 )
+
+        # --- owner gate request -------------------------------------------
+        # Runs after the status branch so a single PATCH can park the card in
+        # its typed gate AND record what the owner is being asked to sign.
+        # This is Hermes' write side only — it poses the question. It can
+        # never answer it: no path here writes ``owner_confirmed``.
+        if payload.owner_gate is not None:
+            _record_owner_gate_request(conn, task_id, payload.owner_gate)
 
         # --- priority -----------------------------------------------------
         if payload.priority is not None:
@@ -949,7 +1229,132 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 )
 
         updated = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(updated) if updated else None}
+        if updated is None:
+            return {"task": None}
+        updated_d = _task_dict(updated)
+        oc = _owner_confirm_card_state(conn, updated)
+        if oc is not None:
+            updated_d["owner_confirm"] = oc
+        return {"task": updated_d}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# POST /tasks/:id/owner-decision  — the DAOS Level-3 owner gate
+# ---------------------------------------------------------------------------
+
+
+class OwnerDecisionBody(BaseModel):
+    """The owner's tri-state decision on one typed gate.
+
+    ``expected_status`` drives the compare-and-swap and ``binding`` pins the
+    decision to the exact recorded artifact/destination/rollback, so a client
+    cannot widen, retarget or stale-replay a decision. Both are re-validated
+    server-side against the ``owner_confirm_requested`` event.
+    """
+
+    decision: str          # "approve" | "reject" | "hold"
+    expected_status: str
+    binding: str
+    reason: Optional[str] = None    # required for reject/hold
+    hold_until: Optional[int] = None  # optional, hold only
+
+
+class OwnerExecutionBody(BaseModel):
+    """Exact approved action Hermes reports after an owner approval."""
+
+    binding: str
+    gate_type: str
+    artifact_sha: str
+    outcome: str
+    note: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/owner-decision")
+def owner_decision(
+    task_id: str, payload: OwnerDecisionBody, board: Optional[str] = Query(None),
+):
+    """Record one owner decision — approve, reject or hold — and nothing else.
+
+    This dedicated endpoint is the single write path into the inert
+    ``owner_confirmed`` status, and the only way to record a rejection or a
+    hold. It executes nothing: no push, no deploy, no external mutation, no
+    automatic regeneration of a rejected candidate. After an approval Hermes
+    may perform only the exact bound action, and Integration → Canary →
+    Owner-visible remains a separate execution sequence with its own readback
+    — this record is not evidence that any of those stages ran.
+
+    Identity limitation (stated rather than papered over): the dashboard is
+    single-user — one per-process session token, no per-human credential and
+    no signature. Anyone holding that token can call this. The recorded
+    ``actor`` is ``owner_dashboard``, meaning "this came from the dashboard's
+    manual owner-decision action", not "this specific human pressed the
+    button". Cryptographic per-person identity is separate work; we do not
+    fabricate a stronger claim in the event log than we can back.
+    """
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        try:
+            record = kanban_db.owner_decide(
+                conn, task_id,
+                decision=payload.decision,
+                expected_status=payload.expected_status,
+                binding=payload.binding,
+                reason=payload.reason,
+                hold_until=payload.hold_until,
+            )
+        except kanban_db.OwnerConfirmMetadataError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except kanban_db.OwnerConfirmStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        updated = kanban_db.get_task(conn, task_id)
+        updated_d = _task_dict(updated) if updated else None
+        if updated is not None and updated_d is not None:
+            oc = _owner_confirm_card_state(conn, updated)
+            if oc is not None:
+                updated_d["owner_confirm"] = oc
+        return {"ok": True, "decision": payload.decision, "task": updated_d,
+                "owner_decision": record}
+    finally:
+        conn.close()
+
+
+@router.post("/tasks/{task_id}/owner-execution")
+def owner_execution(
+    task_id: str,
+    payload: OwnerExecutionBody,
+    board: Optional[str] = Query(None),
+):
+    """Spend one exact approval; this is the only confirmed-card exit."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        try:
+            record = kanban_db.execute_owner_confirmed(
+                conn,
+                task_id,
+                binding=payload.binding,
+                gate_type=payload.gate_type,
+                artifact_sha=payload.artifact_sha,
+                outcome=payload.outcome,
+                note=payload.note,
+            )
+        except kanban_db.OwnerConfirmMetadataError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except kanban_db.OwnerConfirmStateError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        updated = kanban_db.get_task(conn, task_id)
+        return {
+            "ok": True,
+            "owner_execution": record,
+            "task": _task_dict(updated) if updated is not None else None,
+        }
     finally:
         conn.close()
 
@@ -963,9 +1368,14 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        locked = kanban_db.owner_delete_locked(conn, task_id)
+        if locked is not None:
+            raise HTTPException(status_code=403, detail=locked)
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
-            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+            raise HTTPException(status_code=409, detail="task deletion refused")
         return {"deleted": True, "task_id": task_id}
     finally:
         conn.close()
@@ -1047,6 +1457,13 @@ def _set_status_direct(
         )
         if cur.rowcount != 1:
             return False
+        if reopening_satisfied_parent:
+            # Completion fields describe only terminal state. A reopened card
+            # must not continue to advertise stale completion evidence.
+            conn.execute(
+                "UPDATE tasks SET completed_at = NULL, result = NULL WHERE id = ?",
+                (task_id,),
+            )
         run_id = None
         if was_running and new_status != "running" and prev["current_run_id"]:
             run_id = kanban_db._end_run(
@@ -1198,10 +1615,36 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     results.append(entry)
                     continue
                 if payload.archive:
+                    locked = kanban_db.owner_archive_locked(conn, tid)
+                    if locked is not None:
+                        entry.update(ok=False, error=locked)
+                        results.append(entry)
+                        continue
                     if not kanban_db.archive_task(conn, tid):
                         entry.update(ok=False, error="archive refused")
+                        results.append(entry)
+                        continue
                 if payload.status is not None and not payload.archive:
                     s = payload.status
+                    # Owner Confirm containment — same rule as the single-card
+                    # PATCH. Bulk edits must not become a mass-approval or a
+                    # mass-bypass path for Level-3 actions.
+                    if (
+                        s == kanban_db.OWNER_CONFIRMED_STATUS
+                        or (
+                            task.status in kanban_db.OWNER_CONTAINED_STATUSES
+                            and s != task.status
+                        )
+                    ):
+                        entry.update(
+                            ok=False,
+                            error=(
+                                "owner decisions are per-card manual actions; "
+                                "use POST /tasks/{id}/owner-decision"
+                            ),
+                        )
+                        results.append(entry)
+                        continue
                     if s == "done":
                         ok = kanban_db.complete_task(
                             conn, tid,
@@ -1229,7 +1672,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         continue
                     elif s == "scheduled":
                         ok = kanban_db.schedule_task(conn, tid)
-                    elif s in {"todo", "triage"}:
+                    elif s in _DIRECT_STATUS_WRITES:
                         ok = _set_status_direct(conn, tid, s)
                     else:
                         entry.update(ok=False, error=f"unknown status {s!r}")

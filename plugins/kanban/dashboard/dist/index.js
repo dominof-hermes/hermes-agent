@@ -86,25 +86,133 @@
     return body || raw;
   }
 
-  // Order matches BOARD_COLUMNS in plugin_api.py.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
+  // Order matches the owner-facing BOARD_COLUMNS in plugin_api.py. The two
+  // owner-decision columns are pinned leftmost so the owner finds them in the
+  // same place every time, on desktop without horizontal scrolling and on
+  // mobile as the first columns in DOM order. Presentation only — it does not
+  // mean OC precedes Backlog in the lifecycle.
+  const COLUMN_ORDER = [
+    "owner_confirm_required", "owner_confirmed",
+    "backlog", "ready", "running", "review",
+    "integrating", "done", "blocked",
+  ];
+  const BLOCKABLE_STATUSES = new Set([
+    "ready", "running", "review", "ready_for_push", "integrating",
+    "ready_for_deploy", "owner_confirm_required",
+  ]);
+  const COMPLETABLE_STATUSES = new Set(["ready", "running", "blocked"]);
+
+  // --- DAOS Level-3 owner gate ---------------------------------------------
+  //
+  // Avoid the document-recognition acronym already reserved in DAOS/Geumhwa.
+  // Compact English is "OC Required" / "OC Confirmed", the Korean labels are
+  // 대표 승인 필요 / 대표 승인 완료, and the technical
+  // statuses are owner_confirm_required / owner_confirmed.
+  const OWNER_CONFIRM_REQUIRED = "owner_confirm_required";
+  const OWNER_CONFIRMED = "owner_confirmed";
+  // Mirrors kanban_db.OWNER_GATE_TYPES. The two pre-existing code gates keep
+  // their own status on the row — so the exact action and destination survive
+  // — and project into the single OC Required column.
+  const OWNER_GATE_STATUSES = new Set([
+    "ready_for_push", "ready_for_deploy", OWNER_CONFIRM_REQUIRED,
+  ]);
+  const OC_COMPACT_LABEL = {
+    owner_confirm_required: "OC Required",
+    owner_confirmed: "OC Confirmed",
+  };
+  // Fixed 30-second card fields, in render order. Mirrors
+  // kanban_db.OWNER_CARD_FIELDS; the UI renders exactly these and nothing
+  // else — detail stays behind the allowlisted evidence refs.
+  const OC_CARD_FIELDS = [
+    { key: "why", label: "왜 승인 필요한가" },
+    { key: "impact", label: "영향" },
+    { key: "rollback", label: "Rollback" },
+    { key: "recommendation", label: "추천" },
+    { key: "summary_30s", label: "30초 요약" },
+  ];
+  const OC_EVIDENCE_STAGES = [
+    { key: "implemented", label: "SOURCE / IMPLEMENTED" },
+    { key: "tested", label: "TESTED" },
+    { key: "reviewed", label: "REVIEWED" },
+  ];
+  const OC_DECISION_LABEL = {
+    approve: "승인 (Approve)",
+    reject: "반려 (Reject)",
+    hold: "보류 (Hold)",
+  };
+  const OC_UNAVAILABLE = "UNAVAILABLE";
+  // The pinned owner-decision zone, in render order. Mirrors
+  // plugin_api.OWNER_DECISION_COLUMNS. A divider is drawn after the last of
+  // these, before Backlog, to mark the boundary between the owner's decision
+  // zone and the ordinary chronological workflow.
+  const OWNER_DECISION_COLUMNS = [OWNER_CONFIRM_REQUIRED, OWNER_CONFIRMED];
+  const OWNER_ZONE_LABEL = "OWNER DECISION";
+
+  function isOwnerDecisionColumn(name) {
+    return OWNER_DECISION_COLUMNS.indexOf(name) !== -1;
+  }
+
+  // A decision is offerable only when the server says the bound request is
+  // present, valid and non-stale. `available:false` → every action disabled
+  // and the card renders UNAVAILABLE.
+  function ocDecidable(task) {
+    return !!(task && OWNER_GATE_STATUSES.has(task.status)
+      && task.owner_confirm && task.owner_confirm.available
+      && task.owner_confirm.binding);
+  }
+
+  function canMoveTaskToStatus(task, targetStatus) {
+    if (!task) return false;
+    // Owner Confirm containment — mirrors the server-side guard in
+    // plugin_api.update_task / bulk_update:
+    //   * a Confirmed card is inert: dragging it anywhere would turn an
+    //     approval into a bypass of the action Hermes still has to perform;
+    //   * Confirmed is reachable only from a typed gate, only when the bound
+    //     request is decidable, and only through the confirmation dialog
+    //     (see moveTask) — never as a bare status PATCH.
+    if (task.status === OWNER_CONFIRMED) return false;
+    if (targetStatus === OWNER_CONFIRMED) {
+      return ocDecidable(task);
+    }
+    if (targetStatus === "blocked") return BLOCKABLE_STATUSES.has(task.status);
+    if (targetStatus === "done") return COMPLETABLE_STATUSES.has(task.status);
+    return true;
+  }
+
+  function canMoveTasksToStatus(tasks, targetStatus) {
+    return tasks.length > 0 && tasks.every(function (task) {
+      return canMoveTaskToStatus(task, targetStatus);
+    });
+  }
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
-    triage: "Triage",
-    todo: "Todo",
+    backlog: "BACKLOG",
     ready: "Ready",
-    running: "In Progress",
+    running: "Running",
+    review: "Review",
+    ready_for_push: "Ready for Push",
+    integrating: "Integrating",
+    ready_for_deploy: "Ready for Deploy",
+    // Korean is the owner-facing label; the compact English form is rendered
+    // beside it as a badge (see OC_COMPACT_LABEL).
+    owner_confirm_required: "대표 승인 필요",
+    owner_confirmed: "대표 승인 완료",
     blocked: "Blocked",
     done: "Done",
     archived: "Archived",
   };
   const FALLBACK_COLUMN_HELP = {
-    triage: "Raw ideas — a specifier will flesh out the spec",
-    todo: "Waiting on dependencies or unassigned",
+    backlog: "Waiting for specification, dependencies, or priority",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
+    review: "Implementation is awaiting independent review",
+    ready_for_push: "Local commit verified; owner push gate pending",
+    integrating: "Approved change is being integrated",
+    ready_for_deploy: "Integration verified; owner deploy gate pending",
+    owner_confirm_required: "OC Required — Level 3 항목만 대표 승인 대기 (실행 없음)",
+    owner_confirmed: "OC Confirmed — 승인 기록 완료. Hermes가 승인된 동작만 수행",
     blocked: "Worker asked for human input",
     done: "Completed",
     archived: "Archived",
@@ -152,10 +260,15 @@
   }
 
   const COLUMN_DOT = {
-    triage: "hermes-kanban-dot-triage",
-    todo: "hermes-kanban-dot-todo",
+    backlog: "hermes-kanban-dot-backlog",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
+    review: "hermes-kanban-dot-review",
+    ready_for_push: "hermes-kanban-dot-ready-for-push",
+    integrating: "hermes-kanban-dot-integrating",
+    ready_for_deploy: "hermes-kanban-dot-ready-for-deploy",
+    owner_confirm_required: "hermes-kanban-dot-owner-confirm-required",
+    owner_confirmed: "hermes-kanban-dot-owner-confirmed",
     blocked: "hermes-kanban-dot-blocked",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
@@ -641,6 +754,11 @@
     const [lastSelectedId, setLastSelectedId] = useState(null);
     const [failedIds, setFailedIds] = useState(() => new Set());
     const [draggingTaskId, setDraggingTaskId] = useState(null);
+    // Pending owner decision: { taskId, decision }. Set by the explicit
+    // Approve/Reject/Hold buttons AND by a Required -> Confirmed drag, which
+    // is only ever an Approve *shortcut* into the same dialog — never a
+    // direct status write.
+    const [ownerDecision, setOwnerDecision] = useState(null);
     const handleDragStart = useCallback(function (taskId) { setDraggingTaskId(taskId); }, []);
     const handleDragEnd = useCallback(function () { setDraggingTaskId(null); }, []);
     // Per-task event counter incremented whenever the WS stream reports
@@ -648,6 +766,7 @@
     // own task's counter so it reloads itself on live events instead of
     // showing stale data.
     const [taskEventTick, setTaskEventTick] = useState({});
+    const [liveStatus, setLiveStatus] = useState("connecting");
 
     const cursorRef = useRef(0);
     const reloadTimerRef = useRef(null);
@@ -734,6 +853,14 @@
     useEffect(function () {
       if (!boardData) return undefined;
       wsClosedRef.current = false;
+      setLiveStatus("connecting");
+      function scheduleReconnect() {
+        if (wsClosedRef.current) return;
+        setLiveStatus("reconnecting");
+        const delay = Math.min(wsBackoffRef.current, 30000);
+        wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
+        setTimeout(openWs, delay);
+      }
       function openWs() {
         if (wsClosedRef.current) return;
         // Build the WS URL via the host SDK so the correct auth param is used
@@ -753,9 +880,12 @@
         SDK.buildWsUrl(`${API}/events`, wsParams).then(function (url) {
           if (wsClosedRef.current) return;
           let ws;
-          try { ws = new WebSocket(url); } catch (_e) { return; }
+          try { ws = new WebSocket(url); } catch (_e) { scheduleReconnect(); return; }
           wsRef.current = ws;
-          ws.onopen = function () { wsBackoffRef.current = 1000; };
+          ws.onopen = function () {
+            wsBackoffRef.current = 1000;
+            setLiveStatus("live");
+          };
           ws.onmessage = function (ev) {
             try {
               const msg = JSON.parse(ev.data);
@@ -776,21 +906,17 @@
           ws.onclose = function (ev) {
             if (wsClosedRef.current) return;
             if (ev && ev.code === 1008) {
+              setLiveStatus("offline");
               setError(tx(t, "wsAuthFailed",
                 "WebSocket auth failed — reload the page to refresh the session token."));
               return;
             }
-            const delay = Math.min(wsBackoffRef.current, 30000);
-            wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
-            setTimeout(openWs, delay);
+            scheduleReconnect();
           };
         }).catch(function () {
           // Ticket mint / URL build failed (e.g. session expired). Back off
           // and retry; a hard auth failure surfaces via the 1008 close path.
-          if (wsClosedRef.current) return;
-          const delay = Math.min(wsBackoffRef.current, 30000);
-          wsBackoffRef.current = Math.min(wsBackoffRef.current * 2, 30000);
-          setTimeout(openWs, delay);
+          scheduleReconnect();
         });
       }
       openWs();
@@ -822,6 +948,15 @@
 
     // --- actions ------------------------------------------------------------
     const moveTask = useCallback(function (taskId, newStatus) {
+      // Owner Confirm containment. A move into Confirmed is never a status
+      // PATCH: it opens the same confirmation dialog the explicit Approve
+      // button opens, so a drag can only ever be a shortcut *to the dialog*.
+      // The generic PATCH surface rejects `owner_confirmed` server-side too;
+      // this is the local half of the same rule.
+      if (newStatus === OWNER_CONFIRMED) {
+        setOwnerDecision({ taskId: taskId, decision: "approve" });
+        return;
+      }
       const confirmMsg = getDestructiveConfirm(t, newStatus);
       if (confirmMsg && !window.confirm(confirmMsg)) return;
       const patch = withCompletionSummary({ status: newStatus }, 1, t);
@@ -851,6 +986,44 @@
         loadBoard();
       });
     }, [loadBoard, board, t]);
+
+    // Open the owner decision dialog. This is the only entry point for all
+    // three decisions; there is no direct-write path in the client.
+    const requestOwnerDecision = useCallback(function (taskId, decision) {
+      setOwnerDecision({ taskId: taskId, decision: decision || "approve" });
+    }, []);
+
+    // Post one owner decision to the dedicated endpoint. Deliberately NOT
+    // optimistic: an approval must reflect what the server actually recorded,
+    // including a compare-and-swap or stale-binding rejection.
+    const submitOwnerDecision = useCallback(function (task, form) {
+      const oc = (task && task.owner_confirm) || {};
+      const body = {
+        decision: form.decision,
+        expected_status: task.status,
+        binding: oc.binding,
+      };
+      if (form.reason) body.reason = form.reason;
+      if (form.decision === "hold" && form.holdUntil) {
+        const parsed = Date.parse(form.holdUntil + "T23:59:59Z");
+        if (!Number.isNaN(parsed)) body.hold_until = Math.floor(parsed / 1000);
+      }
+      return SDK.fetchJSON(
+        withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/owner-decision`, board),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      ).then(function () {
+        setOwnerDecision(null);
+        loadBoard();
+      }).catch(function (err) {
+        setError("대표 승인 결정 실패: " + parseApiErrorMessage(err));
+        setOwnerDecision(null);
+        loadBoard();
+      });
+    }, [board, loadBoard]);
 
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
@@ -1146,9 +1319,45 @@
     if (!filteredBoard) return null;
 
     const renderMd = !config || config.render_markdown !== false;
+    const liveBadge = liveStatus === "live" ? "LIVE DATA"
+      : liveStatus === "offline" ? "OFFLINE"
+      : liveStatus === "reconnecting" ? "RECONNECTING"
+      : "CONNECTING";
 
     return h(ErrorBoundary, null,
-      h("div", { className: "hermes-kanban flex flex-col gap-4" },
+      h("div", { className: "hermes-kanban hermes-kanban--daos flex flex-col gap-4" },
+        h("section", { className: "hermes-kanban-daos-hero", "aria-label": "DAOS 운영 원칙" },
+          h("div", { className: "hermes-kanban-daos-brand" },
+            h("div", { className: "hermes-kanban-daos-mark", "aria-hidden": "true" }, "D"),
+            h("div", null,
+              h("div", { className: "hermes-kanban-daos-title-row" },
+                h("h1", { className: "hermes-kanban-daos-title" }, "DAOS 2.0 운영 Workspace"),
+                h("span", {
+                  className: cn("hermes-kanban-daos-badge", `hermes-kanban-daos-badge--${liveStatus}`),
+                  role: "status",
+                  "aria-live": "polite",
+                  title: liveStatus === "live" ? "WebSocket live updates connected" : "Live updates are not currently connected",
+                }, liveBadge),
+              ),
+              h("p", { className: "hermes-kanban-daos-purpose" },
+                "사람과 AI가 하나의 조직으로 일하는 AI Native Company"),
+            ),
+          ),
+          h("div", { className: "hermes-kanban-daos-loop" },
+            h("span", { className: "hermes-kanban-daos-loop-label" }, "ADAPTIVE LOOP"),
+            h("ol", { className: "hermes-kanban-daos-loop-steps", "aria-label": "Learn, Execute, Evidence, Adapt, Improve, Evolve, then repeat" },
+              ["Learn", "Execute", "Evidence", "Adapt", "Improve", "Evolve"].map(function (step, index) {
+                return h("li", { key: step, className: "hermes-kanban-daos-loop-item" },
+                  index > 0 ? h("span", { className: "hermes-kanban-daos-loop-arrow", "aria-hidden": "true" }, "→") : null,
+                  h("strong", { className: "hermes-kanban-daos-loop-step" }, step),
+                );
+              }),
+            ),
+            h("span", { className: "hermes-kanban-daos-loop-return" }, "↺ Learn again · Evolve DAOS."),
+            h("span", { className: "hermes-kanban-daos-principle" },
+              "단순함 · 실행 · Evidence · 권한 비확대"),
+          ),
+        ),
         h(BoardSwitcher, {
           board: board,
           boardList: boardList,
@@ -1172,6 +1381,7 @@
           },
         }) : null,
         h(OrchestrationPanel, null),
+        h(OwnerConfirmSummary, { kpi: boardData && boardData.owner_confirm_kpi }),
         h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
@@ -1192,6 +1402,9 @@
         }),
        selectedIds.size > 0 ? h(BulkActionBar, {
          count: selectedIds.size,
+         selectedTasks: boardData.columns.reduce(function (tasks, column) {
+           return tasks.concat(column.tasks);
+         }, []).filter(function (task) { return selectedIds.has(task.id); }),
          assignees: (boardData && boardData.assignees) || [],
          onApply: applyBulk,
          onClear: clearSelected,
@@ -1213,11 +1426,24 @@
           selectAllInColumn,
           onMove: moveTask,
           onMoveSelected: moveSelected,
+          onOwnerDecision: requestOwnerDecision,
           onDelete: deleteTask,
           onOpen: setSelectedTaskId,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
         }),
+        ownerDecision ? (function () {
+          const all = boardData.columns.reduce(
+            function (acc, c) { return acc.concat(c.tasks); }, []);
+          const target = all.find(function (task) { return task.id === ownerDecision.taskId; });
+          if (!target) return null;
+          return h(OwnerDecisionDialog, {
+            task: target,
+            initialDecision: ownerDecision.decision,
+            onCancel: function () { setOwnerDecision(null); },
+            onSubmit: function (form) { submitOwnerDecision(target, form); },
+          });
+        })() : null,
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
           boardSlug: board,
@@ -1266,6 +1492,222 @@
       return bLa - aLa;
     });
     return out;
+  }
+
+  // -------------------------------------------------------------------------
+  // OC summary strip — OC Waiting / Oldest / >= 7 days
+  //
+  // Every number comes from the server's measured task/event timestamps
+  // (plugin_api → kanban_db.owner_confirm_kpi). A missing timestamp renders
+  // as an explicit placeholder, never as "0". Crossing the 7-day band is a
+  // visibility signal only — nothing here approves or rejects anything.
+  // -------------------------------------------------------------------------
+  function OwnerConfirmSummary(props) {
+    const kpi = props.kpi;
+    if (!kpi) return null;
+    const oldestLabel = kpi.oldest_label ? kpi.oldest_label : "—";
+    const band = kpi.oldest_band || "unknown";
+    return h("section", {
+      className: "hermes-kanban-oc-summary",
+      "aria-label": "OC Required 요약 — 대표 승인 대기 현황",
+    },
+      h("span", { className: "hermes-kanban-oc-summary-title" },
+        "OC Required · 대표 승인 필요"),
+      h("dl", { className: "hermes-kanban-oc-summary-stats" },
+        h("div", { className: "hermes-kanban-oc-stat" },
+          h("dt", null, "OC Waiting"),
+          h("dd", { className: "hermes-kanban-oc-stat-value" }, String(kpi.waiting || 0)),
+        ),
+        h("div", { className: "hermes-kanban-oc-stat" },
+          h("dt", null, "Oldest"),
+          h("dd", {
+            className: cn("hermes-kanban-oc-stat-value", "hermes-kanban-oc-age--" + band),
+            title: kpi.oldest_task_id ? `가장 오래 대기 중인 카드: ${kpi.oldest_task_id}` : "대기 중인 카드 없음",
+          }, oldestLabel),
+        ),
+        h("div", { className: "hermes-kanban-oc-stat" },
+          h("dt", null, "≥7 days"),
+          h("dd", {
+            className: cn("hermes-kanban-oc-stat-value",
+              (kpi.aged_7d || 0) > 0 ? "hermes-kanban-oc-age--red" : ""),
+          }, String(kpi.aged_7d || 0)),
+        ),
+        kpi.unknown_age > 0
+          ? h("div", { className: "hermes-kanban-oc-stat" },
+              h("dt", null, "시각 미상"),
+              h("dd", { className: "hermes-kanban-oc-stat-value" }, String(kpi.unknown_age)))
+          : null,
+      ),
+      h("span", { className: "hermes-kanban-oc-summary-note" },
+        "7일 경과는 표시 신호일 뿐이며 자동 승인·반려는 없습니다."),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Owner decision dialog — the ONLY path to Approve / Reject / Hold.
+  //
+  // Renders the fixed 30-second card, the bound artifact fingerprint,
+  // destination and rollback, and the allowlisted evidence refs. Reject and
+  // Hold require a concise reason; Hold may carry a date. Submitting posts to
+  // the dedicated owner-decision endpoint with `expected_status` + `binding`
+  // so the server can compare-and-swap and reject a stale binding.
+  // -------------------------------------------------------------------------
+  function OwnerDecisionDialog(props) {
+    const task = props.task;
+    const oc = (task && task.owner_confirm) || {};
+    const [decision, setDecision] = useState(props.initialDecision || "approve");
+    const [reason, setReason] = useState("");
+    const [holdUntil, setHoldUntil] = useState("");
+    const [busy, setBusy] = useState(false);
+    const firstRef = useRef(null);
+
+    useEffect(function () {
+      if (firstRef.current) firstRef.current.focus();
+    }, []);
+
+    const needsReason = decision === "reject" || decision === "hold";
+    const reasonOk = !needsReason || reason.trim().length > 0;
+    const canSubmit = !busy && !!oc.available && !!oc.binding && reasonOk;
+
+    const submit = function (e) {
+      if (e) e.preventDefault();
+      if (!canSubmit) return;
+      setBusy(true);
+      props.onSubmit({
+        decision: decision,
+        reason: reason.trim() || null,
+        holdUntil: decision === "hold" ? holdUntil : "",
+      });
+    };
+
+    const row = function (label, value, extraClass) {
+      return h("div", { className: "hermes-kanban-oc-row" },
+        h("span", { className: "hermes-kanban-oc-row-label" }, label),
+        h("span", { className: cn("hermes-kanban-oc-row-value", extraClass || "") },
+          value || OC_UNAVAILABLE),
+      );
+    };
+
+    return h("div", {
+      className: "hermes-kanban-dialog-backdrop",
+      onClick: function (e) { if (e.target === e.currentTarget) props.onCancel(); },
+      onKeyDown: function (e) { if (e.key === "Escape") props.onCancel(); },
+    },
+      h("form", {
+        className: "hermes-kanban-dialog hermes-kanban-oc-dialog",
+        role: "dialog",
+        "aria-modal": "true",
+        "aria-label": "대표 승인 결정",
+        onSubmit: submit,
+      },
+        h("div", { className: "hermes-kanban-dialog-title" },
+          "대표 승인 결정 · OC Required"),
+        !oc.available
+          ? h("div", { className: "hermes-kanban-oc-unavailable", role: "alert" },
+              OC_UNAVAILABLE,
+              h("span", { className: "hermes-kanban-oc-unavailable-note" },
+                " 필수 근거가 없거나 만료되었습니다. Hermes가 다시 요청해야 합니다."))
+          : null,
+        h("div", { className: "hermes-kanban-oc-facts" },
+          row("유형 (oc_kind)", oc.oc_kind),
+          row("분류", oc.oc_category),
+          row("게이트", oc.gate_type ? `${oc.gate_type} (${oc.gate_status || ""})` : null),
+          row("아티팩트", oc.artifact_short
+            ? `${oc.artifact_short} · ${oc.artifact_kind || ""}` : null,
+            "hermes-kanban-oc-mono"),
+          row("대상 (destination)", oc.destination),
+          row("Rollback", oc.rollback),
+          row("대기", oc.age_label || "—"),
+        ),
+        h("div", { className: "hermes-kanban-oc-card" },
+          OC_CARD_FIELDS.map(function (field) {
+            const value = (oc.card && oc.card[field.key]) || "";
+            return h("div", { key: field.key, className: "hermes-kanban-oc-row" },
+              h("span", { className: "hermes-kanban-oc-row-label" }, field.label),
+              h("span", { className: "hermes-kanban-oc-row-value" },
+                value || OC_UNAVAILABLE),
+            );
+          }),
+        ),
+        h("div", { className: "hermes-kanban-oc-evidence" },
+          h("span", { className: "hermes-kanban-oc-row-label" }, "Evidence"),
+          OC_EVIDENCE_STAGES.map(function (stage) {
+            const entry = (oc.evidence && oc.evidence[stage.key]) || null;
+            return h("div", { key: stage.key, className: "hermes-kanban-oc-evidence-item" },
+              h("span", { className: "hermes-kanban-oc-evidence-stage" }, stage.label),
+              h("span", { className: "hermes-kanban-oc-mono" },
+                entry ? entry.ref : OC_UNAVAILABLE),
+              entry ? h("span", { className: "hermes-kanban-oc-evidence-summary" },
+                entry.summary) : null,
+            );
+          }),
+        ),
+        h("fieldset", { className: "hermes-kanban-oc-decisions" },
+          h("legend", null, "결정"),
+          ["approve", "reject", "hold"].map(function (value, index) {
+            return h("label", { key: value, className: "hermes-kanban-oc-decision-option" },
+              h("input", {
+                ref: index === 0 ? firstRef : null,
+                type: "radio",
+                name: "hermes-kanban-oc-decision",
+                value: value,
+                checked: decision === value,
+                disabled: !oc.available,
+                onChange: function () { setDecision(value); },
+              }),
+              h("span", null, OC_DECISION_LABEL[value]),
+            );
+          }),
+        ),
+        needsReason
+          ? h("div", { className: "flex flex-col gap-1" },
+              h(Label, { className: "text-xs", htmlFor: "hermes-kanban-oc-reason" },
+                "사유 (필수, 간결하게)"),
+              h("textarea", {
+                id: "hermes-kanban-oc-reason",
+                className: "hermes-kanban-oc-reason",
+                rows: 2,
+                maxLength: 240,
+                value: reason,
+                disabled: !oc.available,
+                onChange: function (e) { setReason(e.target.value); },
+              }),
+            )
+          : null,
+        decision === "hold"
+          ? h("div", { className: "flex flex-col gap-1" },
+              h(Label, { className: "text-xs", htmlFor: "hermes-kanban-oc-hold-until" },
+                "보류 해제 예정일 (선택)"),
+              h("input", {
+                id: "hermes-kanban-oc-hold-until",
+                type: "date",
+                className: "hermes-kanban-oc-hold-until",
+                value: holdUntil,
+                disabled: !oc.available,
+                onChange: function (e) { setHoldUntil(e.target.value); },
+              }),
+            )
+          : null,
+        h("p", { className: "hermes-kanban-oc-disclaimer" },
+          "승인은 기록만 남기며 아무것도 실행하지 않습니다. Integration → Canary → ",
+          "Owner-visible 은 별도 실행·리드백 단계이며, 이 기록은 그 단계들이 ",
+          "완료되었다는 증거가 아닙니다. 이 대시보드는 단일 사용자 인증이며 ",
+          "개인별 암호학적 신원 증명이 아닙니다."),
+        h("div", { className: "hermes-kanban-dialog-actions" },
+          h(Button, {
+            type: "button", variant: "outline", onClick: props.onCancel,
+          }, "취소"),
+          h(Button, {
+            type: "submit",
+            className: "hermes-kanban-oc-submit",
+            disabled: !canSubmit,
+            title: !oc.available
+              ? "필수 근거가 없어 결정할 수 없습니다"
+              : (!reasonOk ? "사유를 입력하세요" : ""),
+          }, OC_DECISION_LABEL[decision]),
+        ),
+      ),
+    );
   }
 
   function AttentionStrip(props) {
@@ -2374,26 +2816,26 @@
         size: "sm",
         title: "Move selected tasks to Ready. Ready tasks are picked up by the dispatcher on the next tick.",
       }, "→ ready"),
-      h(Button, {
+      canMoveTasksToStatus(props.selectedTasks, "blocked") ? h(Button, {
         onClick: function () { props.onApply({ status: "blocked" },
           `Block ${props.count} task(s)?`); },
         size: "sm",
         title: "Block selected tasks. Releases any active claims.",
-      }, "Block"),
+      }, "Block") : null,
       h(Button, {
         onClick: function () { props.onApply({ status: "ready" },
           `Unblock ${props.count} task(s)?`); },
         size: "sm",
         title: "Unblock selected tasks (promote to Ready).",
       }, "Unblock"),
-      h(Button, {
+      canMoveTasksToStatus(props.selectedTasks, "done") ? h(Button, {
         onClick: function () {
           props.onApply({ status: "done" },
             tx(t, "markDone", "Mark {n} task(s) as done?", { n: props.count }));
         },
         size: "sm",
         title: "Mark selected tasks as done. Releases any claims and unblocks dependent children. You'll be asked for a completion summary.",
-      }, tx(t, "complete", "Complete")),
+      }, tx(t, "complete", "Complete")) : null,
       h(Button, {
         onClick: function () {
           props.onApply({ archive: true },
@@ -2633,7 +3075,29 @@
     const handleDragEnd = useCallback(function () {
       if (props.onDragEnd) props.onDragEnd();
     }, [props.onDragEnd]);
-    return h("div", {
+    const scrollStages = function (direction) {
+      const el = columnsRef.current;
+      if (!el) return;
+      el.scrollBy({ left: direction * Math.max(320, el.clientWidth * 0.7), behavior: "smooth" });
+    };
+    return h(React.Fragment, null,
+      isScrollable ? h("nav", {
+        className: "hermes-kanban-stage-nav",
+        "aria-label": "Nine-stage workflow navigation",
+      },
+        h("span", { className: "hermes-kanban-stage-nav-label" }, "9 workflow stages · scroll horizontally"),
+        h("button", {
+          type: "button",
+          onClick: function () { scrollStages(-1); },
+          "aria-label": "Show previous workflow stages",
+        }, "←"),
+        h("button", {
+          type: "button",
+          onClick: function () { scrollStages(1); },
+          "aria-label": "Show next workflow stages",
+        }, "→"),
+      ) : null,
+      h("div", {
       ref: columnsRef,
       className: cn(
         "hermes-kanban-columns",
@@ -2644,10 +3108,32 @@
       onDragEnd: handleDragEnd,
       onMouseDown: handleMouseDown,
     },
-      props.board.columns.map(function (col) {
-        return h(Column, {
+      // Pinned owner-decision zone label. Rendered before the first column so
+      // the leftmost pair reads as a distinct zone rather than as the first
+      // two lifecycle stages.
+      h("div", {
+        className: "hermes-kanban-owner-zone-label",
+        role: "presentation",
+      },
+        h("span", { className: "hermes-kanban-owner-zone-label-text" },
+          OWNER_ZONE_LABEL),
+      ),
+      props.board.columns.reduce(function (nodes, col, index) {
+        // Divider between the owner-decision zone and the workflow columns.
+        const prev = index > 0 ? props.board.columns[index - 1] : null;
+        if (prev && isOwnerDecisionColumn(prev.name) && !isOwnerDecisionColumn(col.name)) {
+          nodes.push(h("div", {
+            key: "hermes-kanban-owner-zone-divider",
+            className: "hermes-kanban-owner-zone-divider",
+            role: "separator",
+            "aria-orientation": "vertical",
+            "aria-label": "OWNER DECISION 영역 끝 — 이후는 일반 업무 흐름",
+          }));
+        }
+        nodes.push(h(Column, {
           key: col.name,
           column: col,
+          ownerZone: isOwnerDecisionColumn(col.name),
           boardMeta: props.boardMeta,
           laneByProfile: props.laneByProfile,
           selectedIds: props.selectedIds,
@@ -2658,16 +3144,19 @@
           selectAllInColumn: props.selectAllInColumn,
           onMove: props.onMove,
           onMoveSelected: props.onMoveSelected,
+          onOwnerDecision: props.onOwnerDecision,
           onOpen: props.onOpen,
           onCreate: props.onCreate,
           allTasks: props.allTasks,
-        });
-      }),
+        }));
+        return nodes;
+      }, []),
       h(TrashDropZone, {
         draggingTaskId: props.draggingTaskId,
         selectedIds: props.selectedIds,
         onDelete: props.onDelete,
       }),
+      ),
     );
   }
 
@@ -2677,6 +3166,15 @@
     const [showCreate, setShowCreate] = useState(false);
     const colRef = useRef(null);
 
+    const tasksForMove = function (taskId) {
+      const isBulk = props.selectedIds
+        && props.selectedIds.has(taskId)
+        && props.selectedIds.size > 1;
+      return (props.allTasks || []).filter(function (task) {
+        return isBulk ? props.selectedIds.has(task.id) : task.id === taskId;
+      });
+    };
+
     // Listen for our synthetic touch-drop events from attachTouchDrag().
     useEffect(function () {
       if (!colRef.current) return undefined;
@@ -2684,6 +3182,8 @@
       function onTouchDrop(e) {
         if (e.detail && e.detail.status === props.column.name) {
           const taskId = e.detail.taskId;
+          const selectedTasks = tasksForMove(taskId);
+          if (!canMoveTasksToStatus(selectedTasks, props.column.name)) return;
           if (props.selectedIds && props.selectedIds.has(taskId) && props.selectedIds.size > 1 && props.onMoveSelected) {
             props.onMoveSelected(props.column.name);
           } else {
@@ -2693,7 +3193,7 @@
       }
       el.addEventListener("hermes-kanban:drop", onTouchDrop);
       return function () { el.removeEventListener("hermes-kanban:drop", onTouchDrop); };
-    }, [props.column.name, props.onMove, props.selectedIds, props.onMoveSelected]);
+    }, [props.column.name, props.onMove, props.selectedIds, props.onMoveSelected, props.allTasks]);
 
     const handleDragOver = function (e) {
       e.preventDefault();
@@ -2706,6 +3206,8 @@
       setDragOver(false);
       const taskId = e.dataTransfer.getData(MIME_TASK);
       if (!taskId) return;
+      const selectedTasks = tasksForMove(taskId);
+      if (!canMoveTasksToStatus(selectedTasks, props.column.name)) return;
       if (props.selectedIds && props.selectedIds.has(taskId) && props.selectedIds.size > 1) {
         if (props.onMoveSelected) props.onMoveSelected(props.column.name);
       } else {
@@ -2731,8 +3233,12 @@
     return h("div", {
       ref: colRef,
       "data-kanban-column": props.column.name,
+      "data-owner-zone": props.ownerZone ? "true" : undefined,
+      role: "region",
+      "aria-label": `${colLabel || props.column.name}, ${props.column.tasks.length} tasks`,
       className: cn(
         "hermes-kanban-column",
+        props.ownerZone ? "hermes-kanban-column--owner-zone" : "",
         dragOver ? "hermes-kanban-column--drop" : "",
       ),
       onDragOver: handleDragOver,
@@ -2751,9 +3257,15 @@
           },
           onClick: function (e) { e.stopPropagation(); },
         }),
-        h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[props.column.name]) }),
+        h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[props.column.name]), "aria-hidden": "true" }),
         h("span", { className: "hermes-kanban-column-label" },
           colLabel || props.column.name),
+        OC_COMPACT_LABEL[props.column.name]
+          ? h("span", {
+              className: "hermes-kanban-oc-badge",
+              title: OC_COMPACT_LABEL[props.column.name],
+            }, OC_COMPACT_LABEL[props.column.name])
+          : null,
         h("span", { className: "hermes-kanban-column-count",
                     title: `${props.column.tasks.length} task${props.column.tasks.length === 1 ? "" : "s"} in this column` },
           props.column.tasks.length),
@@ -2776,7 +3288,7 @@
         },
         onCancel: function () { setShowCreate(false); },
       }) : null,
-      h("div", { className: "hermes-kanban-column-body" },
+      h("div", { className: "hermes-kanban-column-body", role: "list" },
         props.column.tasks.length === 0
           ? h("div", { className: "hermes-kanban-empty" }, tx(t, "noTasks", "— no tasks —"))
           : lanes
@@ -2796,6 +3308,8 @@
                       toggleSelected: props.toggleSelected,
                       toggleRange: props.toggleRange,
                       onOpen: props.onOpen,
+                      onMove: props.onMove,
+                      onOwnerDecision: props.onOwnerDecision,
                     });
                   }),
                 );
@@ -2810,6 +3324,8 @@
                   toggleSelected: props.toggleSelected,
                   toggleRange: props.toggleRange,
                   onOpen: props.onOpen,
+                  onMove: props.onMove,
+                  onOwnerDecision: props.onOwnerDecision,
                 });
               }),
       ),
@@ -2839,6 +3355,92 @@
     if (age >= tier.red)   return "hermes-kanban-card--stale-red";
     if (age >= tier.amber) return "hermes-kanban-card--stale-amber";
     return "";
+  }
+
+  // -------------------------------------------------------------------------
+  // OC card panel — the strict 30-second summary the owner reads on the board.
+  //
+  // Exactly the five fixed fields (왜 승인 필요한가 / 영향 / Rollback / 추천 /
+  // 30초 요약), all server-bounded and server-scrubbed; detail lives behind the
+  // allowlisted evidence refs in the dialog. Values are rendered as text nodes
+  // (React escapes them) — never innerHTML. When the bound request is missing
+  // or stale the panel shows UNAVAILABLE and every decision control is
+  // disabled. A Confirmed card renders inert evidence only, with no controls.
+  // -------------------------------------------------------------------------
+  function OwnerConfirmCardPanel(props) {
+    const t = props.task;
+    const oc = t.owner_confirm || {};
+    const decidable = ocDecidable(t);
+    const card = oc.card || {};
+
+    const decide = function (decision) {
+      return function (e) {
+        e.stopPropagation();
+        if (!decidable || !props.onOwnerDecision) return;
+        props.onOwnerDecision(t.id, decision);
+      };
+    };
+
+    return h("div", {
+      className: cn("hermes-kanban-oc-panel",
+        oc.confirmed ? "hermes-kanban-oc-panel--confirmed" : "",
+        !oc.available ? "hermes-kanban-oc-panel--unavailable" : ""),
+      onClick: function (e) { e.stopPropagation(); },
+    },
+      h("div", { className: "hermes-kanban-oc-panel-head" },
+        h("span", { className: "hermes-kanban-oc-badge" },
+          oc.confirmed ? OC_COMPACT_LABEL.owner_confirmed
+                       : OC_COMPACT_LABEL.owner_confirm_required),
+        oc.oc_kind
+          ? h("span", { className: "hermes-kanban-oc-kind" }, oc.oc_kind)
+          : null,
+        oc.artifact_short
+          ? h("span", { className: "hermes-kanban-oc-mono", title: "artifact fingerprint" },
+              oc.artifact_short)
+          : null,
+        !oc.confirmed && oc.age_label
+          ? h("span", {
+              className: cn("hermes-kanban-oc-age",
+                "hermes-kanban-oc-age--" + (oc.aging_band || "unknown")),
+              title: "대기 기간 — 7일 경과해도 자동 승인·반려는 없습니다",
+            }, oc.age_label)
+          : null,
+      ),
+      !oc.available
+        ? h("div", { className: "hermes-kanban-oc-unavailable", role: "status" },
+            OC_UNAVAILABLE)
+        : h("dl", { className: "hermes-kanban-oc-panel-fields" },
+            OC_CARD_FIELDS.map(function (field) {
+              const value = card[field.key];
+              return h("div", { key: field.key, className: "hermes-kanban-oc-panel-field" },
+                h("dt", null, field.label),
+                h("dd", null, value || OC_UNAVAILABLE),
+              );
+            }),
+          ),
+      oc.hold
+        ? h("div", { className: "hermes-kanban-oc-hold", role: "status" },
+            "보류 중", oc.hold.reason ? " · " + oc.hold.reason : "")
+        : null,
+      oc.confirmed
+        ? h("div", { className: "hermes-kanban-oc-inert" },
+            "승인 기록 완료 — Hermes가 승인된 동작만 수행합니다")
+        : h("div", { className: "hermes-kanban-oc-actions" },
+            ["approve", "reject", "hold"].map(function (decision) {
+              return h("button", {
+                key: decision,
+                type: "button",
+                className: cn("hermes-kanban-oc-action",
+                  "hermes-kanban-oc-action--" + decision),
+                disabled: !decidable,
+                title: decidable ? OC_DECISION_LABEL[decision]
+                                 : "필수 근거가 없어 결정할 수 없습니다",
+                "aria-label": `${OC_DECISION_LABEL[decision]} — ${t.id}`,
+                onClick: decide(decision),
+              }, OC_DECISION_LABEL[decision]);
+            }),
+          ),
+    );
   }
 
   function TaskCard(props) {
@@ -2880,15 +3482,7 @@
       }
       props.onOpen(t.id);
     };
-    const handleKeyDown = function (e) {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        props.onOpen(t.id);
-      }
-      if (e.key === "Escape") {
-        if (props.toggleSelected) props.toggleSelected(t.id, false);
-      }
-    };
+
     const handleCheckedChange = function () {
       props.toggleSelected(t.id, true);
     };
@@ -2896,7 +3490,8 @@
     const progress = t.progress;
     const needsAssignee = t.status === "ready" && !t.assignee;
 
-    return h("div", {
+    const titleId = `kanban-task-title-${t.id}`;
+    return h("article", {
       ref: cardRef,
       "data-task-id": t.id,
       className: cn(
@@ -2907,12 +3502,9 @@
         stalenessClass(t),
       ),
       draggable: true,
-      tabIndex: 0,
-      role: "button",
-      "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.status}`,
+      role: "listitem",
+      "aria-labelledby": titleId,
       onDragStart: handleDragStart,
-      onClick: handleClick,
-      onKeyDown: handleKeyDown,
     },
       h(Card, null,
         h(CardContent, { className: "hermes-kanban-card-content" },
@@ -2972,8 +3564,17 @@
                 }, tx(i18n, "needsAssignee", "Needs assignee"))
               : null,
           ),
-          h("div", { className: "hermes-kanban-card-title" },
-            t.title || tx(i18n, "untitled", "(untitled)")),
+          h("button", {
+            type: "button",
+            id: titleId,
+            className: "hermes-kanban-card-open",
+            onClick: handleClick,
+            "aria-label": `Open task ${t.id}: ${t.title || "untitled"}`,
+          }, t.title || tx(i18n, "untitled", "(untitled)")),
+          t.owner_confirm ? h(OwnerConfirmCardPanel, {
+            task: t,
+            onOwnerDecision: props.onOwnerDecision,
+          }) : null,
           h("div", { className: "hermes-kanban-card-row hermes-kanban-card-meta" },
             t.assignee
               ? h("span", { className: "hermes-kanban-assignee",
@@ -2995,6 +3596,33 @@
             h("span", { className: "hermes-kanban-ago",
                         title: t.created_at ? `Created ${t.created_at}` : "" },
               timeAgo ? timeAgo(t.created_at) : ""),
+            h("select", {
+              className: "hermes-kanban-card-move",
+              defaultValue: "",
+              "aria-label": `Move task ${t.id}`,
+              onClick: function (e) { e.stopPropagation(); },
+              onChange: function (e) {
+                const nextStatus = e.target.value;
+                if (nextStatus && props.onMove) props.onMove(t.id, nextStatus);
+                e.target.value = "";
+              },
+            },
+              h("option", { value: "" }, "Move to…"),
+              COLUMN_ORDER.filter(function (status) {
+                if (status === t.status || status === "running") return false;
+                // Owner Confirm containment: a Confirmed card offers no moves
+                // at all, and Confirmed is offered only when the bound request
+                // is decidable (selecting it opens the dialog, never a PATCH).
+                if (t.status === OWNER_CONFIRMED) return false;
+                if (status === OWNER_CONFIRMED) return ocDecidable(t);
+                if (status === "blocked" && !BLOCKABLE_STATUSES.has(t.status)) return false;
+                if (status === "done" && !COMPLETABLE_STATUSES.has(t.status)) return false;
+                return true;
+              }).map(function (status) {
+                return h("option", { key: status, value: status },
+                  getColumnLabel(i18n, status) || status);
+              }),
+            ),
           ),
         ),
       ),
@@ -3039,7 +3667,7 @@
         title: trimmed,
         assignee: assignee.trim() || null,
         priority: Number(priority) || 0,
-        triage: props.columnName === "triage",
+        triage: props.columnName === "backlog" || props.columnName === "triage",
       };
       if (parent) body.parents = [parent];
       // Parse comma-separated skills into a clean list. Blank = no
@@ -3687,7 +4315,8 @@
         t.tenant ? h(MetaRow, { label: tx(i18n, "tenant", "Tenant"), value: t.tenant }) : null,
         h(MetaRow, {
           label: tx(i18n, "workspace", "Workspace"),
-          value: `${t.workspace_kind}${t.workspace_path ? ": " + t.workspace_path : ""}`,
+          value: props.boardSlug === "daos-2-0" ? "Managed workspace" :
+            `${t.workspace_kind}${t.workspace_path ? ": " + t.workspace_path : ""}`,
         }),
         (t.skills && t.skills.length > 0) ? h(MetaRow, {
           label: tx(i18n, "skills", "Skills"),
@@ -4335,11 +4964,11 @@
         // dispatcher's claim_task path, which atomically creates the run row,
         // claim lock, and worker process metadata.
         b(tx(t, "block", "Block"),     { status: "blocked" },
-          task.status === "running" || task.status === "ready",
+          BLOCKABLE_STATUSES.has(task.status),
           getDestructiveConfirm(t, "blocked")),
         b(tx(t, "unblock", "Unblock"),   { status: "ready" },    task.status === "blocked"),
         b(tx(t, "complete", "Complete"),  { status: "done" },
-          task.status === "running" || task.status === "ready" || task.status === "blocked",
+          COMPLETABLE_STATUSES.has(task.status),
           getDestructiveConfirm(t, "done")),
         b(tx(t, "archive", "Archive"),   { status: "archived" }, task.status !== "archived",
           getDestructiveConfirm(t, "archived")),

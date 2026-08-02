@@ -1,9 +1,19 @@
 /*
  * Hermes Kanban — dashboard plugin styles.
  *
- * All colors reference theme CSS vars so the board reskins with the
- * active dashboard theme. No hardcoded palette.
+ * Core plugin rules follow the dashboard theme variables. The DAOS section
+ * at the end applies the scoped operations-dashboard visual language.
  */
+
+/* Pretendard GOV — SIL Open Font License 1.1. The variable font and license
+ * are vendored under ./fonts so the dashboard has no runtime CDN dependency. */
+@font-face {
+  font-family: "Pretendard GOV Variable";
+  font-style: normal;
+  font-weight: 45 920;
+  font-display: swap;
+  src: url("./fonts/PretendardGOVVariable.woff2") format("woff2-variations");
+}
 
 .hermes-kanban {
   width: 100%;
@@ -170,13 +180,18 @@
   border-radius: 999px;
   background: var(--color-muted-foreground);
 }
-.hermes-kanban-dot-triage   { background: #b47dd6; }  /* lilac — fresh/unspecified */
-.hermes-kanban-dot-todo     { background: var(--color-muted-foreground); }
-.hermes-kanban-dot-ready    { background: #d4b348; }  /* amber */
-.hermes-kanban-dot-running  { background: #3fb97d; }  /* green */
-.hermes-kanban-dot-blocked  { background: var(--color-destructive, #d14a4a); }
-.hermes-kanban-dot-done     { background: #4a8cd1; }  /* blue */
-.hermes-kanban-dot-archived { background: var(--color-border); }
+.hermes-kanban-dot-triage           { background: #b47dd6; }
+.hermes-kanban-dot-todo             { background: var(--color-muted-foreground); }
+.hermes-kanban-dot-backlog          { background: #8b95a5; }
+.hermes-kanban-dot-ready            { background: #d4b348; }
+.hermes-kanban-dot-running          { background: #3fb97d; }
+.hermes-kanban-dot-review           { background: #a879d6; }
+.hermes-kanban-dot-ready-for-push   { background: #d58a3a; }
+.hermes-kanban-dot-integrating      { background: #2f9bb3; }
+.hermes-kanban-dot-ready-for-deploy { background: #4f7bd9; }
+.hermes-kanban-dot-blocked          { background: var(--color-destructive, #d14a4a); }
+.hermes-kanban-dot-done             { background: #4a8cd1; }
+.hermes-kanban-dot-archived         { background: var(--color-border); }
 
 /* ---- Progress pill (N/M child tasks done) --------------------------- */
 
@@ -1591,6 +1606,285 @@
   font-weight: 500;
 }
 
+/* ---- DAOS 2.0 operations visual language ----------------------------- */
+
+.hermes-kanban--daos {
+  --color-background: #090d16;
+  --color-card: #131b2e;
+  --color-popover: #131b2e;
+  --color-border: #24324d;
+  --color-foreground: #f1f5f9;
+  --color-muted-foreground: #8094ae;
+  --color-primary: #0ea5e9;
+  --color-ring: #0ea5e9;
+  --color-destructive: #f43f5e;
+  box-sizing: border-box;
+  min-height: calc(100vh - 3rem);
+  padding: clamp(0.9rem, 2vw, 1.5rem);
+  border: 1px solid #1b2941;
+  border-radius: 1rem;
+  background:
+    radial-gradient(circle at 92% -8%, rgba(14, 165, 233, 0.13), transparent 28rem),
+    #090d16;
+  color: #f1f5f9;
+  font-family: "Pretendard GOV Variable", "Pretendard GOV", "Pretendard", sans-serif;
+  letter-spacing: -0.012em;
+}
+
+.hermes-kanban-daos-hero {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding: 0.25rem 0 1rem;
+  border-bottom: 1px solid #24324d;
+}
+
+.hermes-kanban-daos-brand,
+.hermes-kanban-daos-title-row,
+.hermes-kanban-daos-loop-steps {
+  display: flex;
+  align-items: center;
+}
+
+.hermes-kanban-daos-brand { gap: 0.85rem; }
+.hermes-kanban-daos-title-row { flex-wrap: wrap; gap: 0.65rem; }
+
+.hermes-kanban-daos-mark {
+  display: grid;
+  width: 2.35rem;
+  height: 2.35rem;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid rgba(14, 165, 233, 0.45);
+  border-radius: 0.65rem;
+  background: linear-gradient(145deg, rgba(14, 165, 233, 0.18), rgba(19, 27, 46, 0.8));
+  color: #38bdf8;
+  font-size: 1.05rem;
+  font-weight: 800;
+}
+
+.hermes-kanban-daos-title {
+  margin: 0;
+  color: #f1f5f9;
+  font-size: clamp(1.1rem, 2vw, 1.45rem);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+}
+
+.hermes-kanban-daos-badge {
+  padding: 0.2rem 0.5rem;
+  border: 1px solid #24324d;
+  border-radius: 999px;
+  background: #131b2e;
+  color: #38bdf8;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.hermes-kanban-daos-badge--connecting,
+.hermes-kanban-daos-badge--reconnecting {
+  border-color: rgba(245, 158, 11, 0.45);
+  color: #fbbf24;
+  background: rgba(245, 158, 11, 0.09);
+}
+
+.hermes-kanban-daos-badge--offline {
+  border-color: rgba(244, 63, 94, 0.48);
+  color: #fb7185;
+  background: rgba(244, 63, 94, 0.09);
+}
+
+.hermes-kanban-daos-purpose {
+  margin: 0.3rem 0 0;
+  color: #8094ae;
+  font-size: 0.74rem;
+}
+
+.hermes-kanban-daos-loop {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 0.28rem;
+  text-align: right;
+}
+
+.hermes-kanban-daos-loop-label {
+  color: #38bdf8;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.58rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+}
+
+.hermes-kanban-daos-loop-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.3rem;
+  color: #f1f5f9;
+  font-size: 0.76rem;
+}
+
+.hermes-kanban-daos-loop-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.hermes-kanban-daos-loop-step { font-weight: 650; }
+.hermes-kanban-daos-loop-arrow { color: #0ea5e9; }
+.hermes-kanban-daos-loop-return { color: #38bdf8; font-size: 0.76rem; font-weight: 700; }
+.hermes-kanban-daos-principle { color: #8094ae; font-size: 0.75rem; }
+
+.hermes-kanban--daos .hermes-kanban-boardswitcher,
+.hermes-kanban--daos .hermes-kanban-boardswitcher-compact,
+.hermes-kanban--daos .hermes-kanban-column,
+.hermes-kanban--daos .hermes-kanban-card {
+  border-color: #24324d;
+  background: #131b2e;
+}
+
+.hermes-kanban--daos .hermes-kanban-column {
+  border-radius: 0.75rem;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.16);
+  min-height: min(68vh, 760px);
+  scroll-snap-align: start;
+}
+
+.hermes-kanban--daos .hermes-kanban-stage-nav {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  color: #8094ae;
+  font-size: 0.78rem;
+}
+
+.hermes-kanban--daos .hermes-kanban-stage-nav button {
+  width: 2.5rem;
+  height: 2.5rem;
+  border: 1px solid #24324d;
+  border-radius: 0.5rem;
+  background: #131b2e;
+  color: #f1f5f9;
+  cursor: pointer;
+  font-size: 1rem;
+}
+
+.hermes-kanban--daos .hermes-kanban-stage-nav button:hover {
+  border-color: #0ea5e9;
+  background: #17243a;
+}
+
+.hermes-kanban--daos .hermes-kanban-columns {
+  scroll-snap-type: x proximity;
+  scrollbar-color: #0ea5e9 #131b2e;
+  scrollbar-width: auto;
+  padding-bottom: 0.65rem;
+}
+
+.hermes-kanban--daos .hermes-kanban-column-header {
+  color: #f1f5f9;
+  letter-spacing: 0.025em;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #131b2e;
+}
+
+.hermes-kanban--daos .hermes-kanban-card {
+  border: 1px solid #24324d;
+  border-radius: 0.6rem;
+  box-shadow: 0 5px 15px rgba(0, 0, 0, 0.14);
+}
+
+.hermes-kanban--daos .hermes-kanban-card:hover {
+  border-color: rgba(14, 165, 233, 0.7);
+  box-shadow: 0 0 0 1px rgba(14, 165, 233, 0.25), 0 10px 25px rgba(0, 0, 0, 0.22);
+}
+
+.hermes-kanban--daos .hermes-kanban-card-open {
+  appearance: none;
+  width: 100%;
+  padding: 0.15rem 0;
+  border: 0;
+  background: transparent;
+  color: #f1f5f9;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.86rem;
+  font-weight: 650;
+  line-height: 1.35;
+  text-align: left;
+}
+
+.hermes-kanban--daos .hermes-kanban-card-move {
+  min-height: 2.5rem;
+  margin-left: auto;
+  padding: 0 0.5rem;
+  border: 1px solid #24324d;
+  border-radius: 0.45rem;
+  background: #101827;
+  color: #cbd5e1;
+  font-family: "Pretendard GOV Variable", "Pretendard GOV", sans-serif;
+  font-size: 0.72rem;
+}
+
+.hermes-kanban--daos .hermes-kanban-column-add,
+.hermes-kanban--daos .hermes-kanban-card-check-wrap {
+  min-width: 2.5rem;
+  min-height: 2.5rem;
+}
+
+.hermes-kanban--daos :is(button, select, input, textarea, [tabindex]):focus-visible,
+.hermes-kanban-drawer :is(button, select, input, textarea, [tabindex]):focus-visible {
+  outline: 3px solid #38bdf8;
+  outline-offset: 2px;
+}
+
+.hermes-kanban--daos [data-kanban-column="blocked"] {
+  border-color: rgba(244, 63, 94, 0.65);
+}
+
+.hermes-kanban--daos .hermes-kanban-dot-backlog { background: #64748b; }
+.hermes-kanban--daos .hermes-kanban-dot-ready { background: #f59e0b; }
+.hermes-kanban--daos .hermes-kanban-dot-running { background: #3b82f6; }
+.hermes-kanban--daos .hermes-kanban-dot-review { background: #a78bfa; }
+.hermes-kanban--daos .hermes-kanban-dot-ready-for-push { background: #f97316; }
+.hermes-kanban--daos .hermes-kanban-dot-integrating { background: #06b6d4; }
+.hermes-kanban--daos .hermes-kanban-dot-ready-for-deploy { background: #0ea5e9; }
+.hermes-kanban--daos .hermes-kanban-dot-done { background: #10b981; }
+.hermes-kanban--daos .hermes-kanban-dot-blocked { background: #f43f5e; }
+
+.hermes-kanban-drawer {
+  --color-card: #131b2e;
+  --color-border: #24324d;
+  --color-foreground: #f1f5f9;
+  --color-muted-foreground: #8094ae;
+  --color-ring: #0ea5e9;
+  background: #131b2e;
+  color: #f1f5f9;
+  font-family: "Pretendard GOV Variable", "Pretendard GOV", "Pretendard", sans-serif;
+  border-left: 1px solid #24324d;
+}
+
+@media (max-width: 900px) {
+  .hermes-kanban-daos-hero {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .hermes-kanban-daos-loop {
+    align-items: flex-start;
+    text-align: left;
+  }
+  .hermes-kanban-daos-loop-steps { justify-content: flex-start; }
+}
+
 /* ---- DAOS Usage P0 ------------------------------------------------------ */
 .hermes-kanban-shell {
   display: flex;
@@ -1670,3 +1964,313 @@
 .hermes-kanban-usage-empty,
 .hermes-kanban-usage-error { color: #94a3b8; text-align: center !important; }
 .hermes-kanban-usage-error { padding: 0.75rem 1rem 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .hermes-kanban--daos *,
+  .hermes-kanban-drawer * {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
+/* ---- DAOS Owner Confirm (OC) -------------------------------------------- */
+/* Midnight Graphite palette + Pretendard GOV, matching the surrounding DAOS
+   grammar. The two owner-decision columns are a pinned zone at the left edge
+   of the rail; the divider marks where the chronological workflow begins. */
+
+.hermes-kanban-dot-owner-confirm-required { background: #f59e0b; }
+.hermes-kanban-dot-owner-confirmed        { background: #34d399; }
+.hermes-kanban--daos .hermes-kanban-dot-owner-confirm-required { background: #fbbf24; }
+.hermes-kanban--daos .hermes-kanban-dot-owner-confirmed { background: #10b981; }
+
+/* Zone label sits above the pinned pair, outside the scrolling flow of the
+   ordinary columns but inside the same rail so it scrolls with them. */
+.hermes-kanban-owner-zone-label {
+  flex: 0 0 auto;
+  align-self: stretch;
+  display: flex;
+  align-items: flex-start;
+  padding-top: 0.35rem;
+}
+.hermes-kanban-owner-zone-label-text {
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+  letter-spacing: 0.18em;
+  font-family: "Pretendard GOV Variable", "Pretendard GOV", "Pretendard", sans-serif;
+  font-size: 0.62rem;
+  font-weight: 700;
+  color: #7dd3fc;
+  opacity: 0.85;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.hermes-kanban-owner-zone-divider {
+  flex: 0 0 1px;
+  align-self: stretch;
+  min-height: 200px;
+  margin: 0 0.35rem;
+  background: linear-gradient(180deg,
+    rgba(14, 165, 233, 0) 0%,
+    rgba(14, 165, 233, 0.55) 18%,
+    rgba(14, 165, 233, 0.55) 82%,
+    rgba(14, 165, 233, 0) 100%);
+}
+
+.hermes-kanban-column--owner-zone {
+  border-color: rgba(14, 165, 233, 0.45);
+  background: color-mix(in srgb, #101827 92%, #0ea5e9);
+}
+.hermes-kanban--daos .hermes-kanban-column--owner-zone {
+  background: #121c30;
+  border-color: rgba(56, 189, 248, 0.45);
+  box-shadow: inset 0 1px 0 rgba(56, 189, 248, 0.12);
+}
+
+.hermes-kanban-oc-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  border: 1px solid rgba(56, 189, 248, 0.45);
+  color: #7dd3fc;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+/* --- OC summary strip (OC Waiting / Oldest / >= 7 days) --- */
+.hermes-kanban-oc-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1.25rem;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid #24324d;
+  border-left: 3px solid #38bdf8;
+  border-radius: 0.6rem;
+  background: #131b2e;
+  color: #f1f5f9;
+  font-family: "Pretendard GOV Variable", "Pretendard GOV", "Pretendard", sans-serif;
+}
+.hermes-kanban-oc-summary-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.hermes-kanban-oc-summary-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1.1rem;
+  margin: 0;
+}
+.hermes-kanban-oc-stat { display: flex; align-items: baseline; gap: 0.4rem; }
+.hermes-kanban-oc-stat dt {
+  font-size: 0.68rem;
+  color: #8094ae;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.hermes-kanban-oc-stat dd { margin: 0; }
+.hermes-kanban-oc-stat-value {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+.hermes-kanban-oc-summary-note {
+  margin-left: auto;
+  font-size: 0.68rem;
+  color: #8094ae;
+}
+
+/* Aging bands: < 3d neutral, 3-6d amber, >= 7d red. Display only. */
+.hermes-kanban-oc-age--neutral { color: #cbd5e1; }
+.hermes-kanban-oc-age--amber   { color: #fbbf24; }
+.hermes-kanban-oc-age--red     { color: #fb7185; }
+.hermes-kanban-oc-age--unknown { color: #8094ae; }
+
+/* --- OC card panel --- */
+.hermes-kanban-oc-panel {
+  margin-top: 0.4rem;
+  padding: 0.45rem 0.5rem;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  border-radius: 0.45rem;
+  background: rgba(14, 165, 233, 0.06);
+  font-family: "Pretendard GOV Variable", "Pretendard GOV", "Pretendard", sans-serif;
+}
+.hermes-kanban-oc-panel--confirmed {
+  border-color: rgba(16, 185, 129, 0.35);
+  background: rgba(16, 185, 129, 0.06);
+}
+.hermes-kanban-oc-panel--unavailable { border-color: rgba(148, 163, 184, 0.35); }
+.hermes-kanban-oc-panel-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.3rem;
+}
+.hermes-kanban-oc-kind {
+  font-size: 0.66rem;
+  color: #cbd5e1;
+  letter-spacing: 0.02em;
+}
+.hermes-kanban-oc-mono {
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.68rem;
+  color: #94a3b8;
+  overflow-wrap: anywhere;
+}
+.hermes-kanban-oc-age { font-size: 0.66rem; font-weight: 700; margin-left: auto; }
+.hermes-kanban-oc-panel-fields { margin: 0; display: grid; gap: 0.15rem; }
+.hermes-kanban-oc-panel-field { display: grid; grid-template-columns: 6.5rem 1fr; gap: 0.4rem; }
+.hermes-kanban-oc-panel-field dt {
+  font-size: 0.64rem;
+  color: #8094ae;
+  white-space: nowrap;
+}
+.hermes-kanban-oc-panel-field dd {
+  margin: 0;
+  font-size: 0.7rem;
+  color: #e2e8f0;
+  overflow-wrap: anywhere;
+  /* Safe text rendering: values are React text nodes, never innerHTML. */
+  white-space: pre-wrap;
+}
+.hermes-kanban-oc-unavailable {
+  padding: 0.3rem 0.4rem;
+  border-radius: 0.35rem;
+  background: rgba(148, 163, 184, 0.14);
+  color: #cbd5e1;
+  font-family: ui-monospace, SFMono-Regular, monospace;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+.hermes-kanban-oc-unavailable-note {
+  font-family: "Pretendard GOV Variable", "Pretendard GOV", sans-serif;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+.hermes-kanban-oc-hold {
+  margin-top: 0.3rem;
+  font-size: 0.66rem;
+  color: #fbbf24;
+}
+.hermes-kanban-oc-inert {
+  margin-top: 0.3rem;
+  font-size: 0.66rem;
+  color: #6ee7b7;
+}
+.hermes-kanban-oc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin-top: 0.4rem;
+}
+.hermes-kanban-oc-action {
+  appearance: none;
+  flex: 1 1 auto;
+  min-height: 2.5rem;
+  padding: 0 0.5rem;
+  border: 1px solid #24324d;
+  border-radius: 0.45rem;
+  background: #101827;
+  color: #e2e8f0;
+  cursor: pointer;
+  font-family: "Pretendard GOV Variable", "Pretendard GOV", sans-serif;
+  font-size: 0.7rem;
+  font-weight: 650;
+}
+.hermes-kanban-oc-action--approve { border-color: rgba(16, 185, 129, 0.5); color: #6ee7b7; }
+.hermes-kanban-oc-action--reject  { border-color: rgba(244, 63, 94, 0.5); color: #fda4af; }
+.hermes-kanban-oc-action--hold    { border-color: rgba(251, 191, 36, 0.5); color: #fcd34d; }
+.hermes-kanban-oc-action:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* --- OC decision dialog --- */
+.hermes-kanban-oc-dialog {
+  max-width: 34rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  font-family: "Pretendard GOV Variable", "Pretendard GOV", "Pretendard", sans-serif;
+}
+.hermes-kanban-oc-facts,
+.hermes-kanban-oc-card,
+.hermes-kanban-oc-evidence {
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid #24324d;
+  border-radius: 0.5rem;
+  background: #101827;
+}
+.hermes-kanban-oc-row { display: grid; grid-template-columns: 9rem 1fr; gap: 0.5rem; }
+.hermes-kanban-oc-row-label { font-size: 0.68rem; color: #8094ae; }
+.hermes-kanban-oc-row-value {
+  font-size: 0.74rem;
+  color: #e2e8f0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.hermes-kanban-oc-evidence-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: baseline;
+}
+.hermes-kanban-oc-evidence-stage {
+  font-size: 0.62rem;
+  color: #7dd3fc;
+  letter-spacing: 0.05em;
+}
+.hermes-kanban-oc-evidence-summary { font-size: 0.7rem; color: #cbd5e1; }
+.hermes-kanban-oc-decisions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  border: 1px solid #24324d;
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.6rem;
+}
+.hermes-kanban-oc-decisions legend { font-size: 0.68rem; color: #8094ae; padding: 0 0.3rem; }
+.hermes-kanban-oc-decision-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-height: 2.5rem;
+  font-size: 0.74rem;
+  cursor: pointer;
+}
+.hermes-kanban-oc-reason,
+.hermes-kanban-oc-hold-until {
+  width: 100%;
+  min-height: 2.5rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid #24324d;
+  border-radius: 0.45rem;
+  background: #101827;
+  color: #f1f5f9;
+  font-family: inherit;
+  font-size: 0.76rem;
+}
+.hermes-kanban-oc-disclaimer {
+  margin: 0;
+  font-size: 0.66rem;
+  line-height: 1.5;
+  color: #8094ae;
+}
+
+/* Mobile: keep the pinned pair first in the scroll order and preserve
+   accessible horizontal scrolling (no scroll trapping, snap is proximity). */
+@media (max-width: 900px) {
+  .hermes-kanban-owner-zone-label { display: none; }
+  .hermes-kanban-owner-zone-divider { min-height: 120px; }
+  .hermes-kanban-column--owner-zone { scroll-snap-align: start; }
+  .hermes-kanban-oc-summary-note { margin-left: 0; }
+  .hermes-kanban-oc-panel-field { grid-template-columns: 5.25rem 1fr; }
+  .hermes-kanban-oc-row { grid-template-columns: 1fr; }
+}
