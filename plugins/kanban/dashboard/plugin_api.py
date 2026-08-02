@@ -1046,7 +1046,12 @@ class UpdateTaskBody(BaseModel):
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
+    request_committed = False
     try:
+        # One PATCH is one SQLite transaction. Called domain operations join
+        # this boundary through write_txn's re-entrant participation path, so
+        # no nested operation commits a partial assignee/status/field/event set.
+        kanban_db._execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1235,8 +1240,16 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         oc = _owner_confirm_card_state(conn, updated)
         if oc is not None:
             updated_d["owner_confirm"] = oc
+        kanban_db._execute_boundary_with_retry(conn, "COMMIT")
+        request_committed = True
+        kanban_db._check_file_length_invariant(conn)
         return {"task": updated_d}
     finally:
+        if not request_committed and conn.in_transaction:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError:
+                pass
         conn.close()
 
 

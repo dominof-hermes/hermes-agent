@@ -1055,10 +1055,39 @@ def test_daos_board_copy_and_cards_expose_truthful_accessible_controls():
     assert 'className: "hermes-kanban-stage-nav"' in bundle
     assert "9 workflow stages" in bundle
     assert 'props.boardSlug === "daos-2-0" ? "Managed workspace"' in bundle
-    assert "BLOCKABLE_STATUSES.has(t.status)" in bundle
-    assert "COMPLETABLE_STATUSES.has(t.status)" in bundle
+    assert "canMoveTaskToStatus(t, status)" in bundle
     assert "BLOCKABLE_STATUSES.has(task.status)" in bundle
     assert "COMPLETABLE_STATUSES.has(task.status)" in bundle
+
+
+def test_owner_gate_ui_exposes_only_decision_controls_and_confirmed_is_inert():
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text(encoding="utf-8")
+    assert "if (OWNER_GATE_STATUSES.has(task.status))" in bundle
+    assert "return targetStatus === OWNER_CONFIRMED && ocDecidable(task);" in bundle
+    assert "const generalActionsAllowed = !OWNER_CONTAINED_STATUSES.has(task.status);" in bundle
+    assert "generalActionsAllowed ? h(React.Fragment" in bundle
+    assert "if (!OWNER_CONTAINED_STATUSES.has(t.status)) next.add(t.id);" in bundle
+    assert "if (!OWNER_CONTAINED_STATUSES.has(t.status)) order.push(t.id);" in bundle
+    assert "const selectable = (col.tasks || []).filter" in bundle
+    assert "!props.ownerZone ? h(Checkbox" in bundle
+    assert "draggable: !OWNER_CONTAINED_STATUSES.has(t.status)" in bundle
+    assert '!OWNER_CONTAINED_STATUSES.has(t.status) ? h("label"' in bundle
+
+
+def test_owner_decision_modal_traps_focus_restores_invoker_and_announces_success():
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text(encoding="utf-8")
+    assert "trapDialogTabKey(dialogRef.current, e)" in bundle
+    assert 'e.key !== "Tab"' in bundle
+    assert "ownerDecisionInvokerRef.current.focus()" in bundle
+    assert 'role: "status"' in bundle
+    assert '"aria-live": "polite"' in bundle
+    assert "setOwnerDecisionAnnouncement" in bundle
 
 
 @pytest.mark.parametrize(

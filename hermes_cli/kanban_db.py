@@ -2558,6 +2558,14 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    # Domain operations may compose inside one request-level transaction. The
+    # outermost owner owns BEGIN/COMMIT/ROLLBACK; inner operations participate
+    # without a SAVEPOINT, inner commit, or independent rollback. Thus a late
+    # sibling failure can still roll back every earlier field and event.
+    if conn.in_transaction:
+        yield conn
+        return
+
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
@@ -5192,6 +5200,11 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        if cur_row["status"] in OWNER_CONTAINED_STATUSES:
+            # Generic block previously enabled the exact bypass chain
+            # gate -> blocked -> ready -> claim. Typed gate failure belongs to
+            # owner_decide; approved work advances through owner execution.
+            return False
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -5269,9 +5282,7 @@ def block_task(
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN (
-                       'running', 'ready', 'review', 'ready_for_push',
-                       'integrating', 'ready_for_deploy',
-                       'owner_confirm_required'
+                       'running', 'ready', 'review', 'integrating'
                    )
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
                 (kind, recurrences, task_id) if expected_run_id is None
@@ -5312,9 +5323,7 @@ def block_task(
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN (
-                           'running', 'ready', 'review', 'ready_for_push',
-                           'integrating', 'ready_for_deploy',
-                           'owner_confirm_required'
+                           'running', 'ready', 'review', 'integrating'
                        )
                     """,
                     (kind, recurrences, task_id),
@@ -5331,9 +5340,7 @@ def block_task(
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN (
-                           'running', 'ready', 'review', 'ready_for_push',
-                           'integrating', 'ready_for_deploy',
-                           'owner_confirm_required'
+                           'running', 'ready', 'review', 'integrating'
                        )
                        AND current_run_id = ?
                     """,
@@ -5454,6 +5461,10 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        # Defense in depth for legacy/external rows: owner audit must not be
+        # laundered into dispatchable ready work by generic unblock.
+        if has_owner_audit_history(conn, task_id):
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -6427,6 +6438,16 @@ def has_owner_decision_history(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT 1 FROM task_events WHERE task_id = ? AND kind IN (%s) LIMIT 1"
         % ",".join("?" * len(OWNER_DECISION_EVENTS)),
         (task_id, *OWNER_DECISION_EVENTS),
+    ).fetchone()
+    return row is not None
+
+
+def has_owner_audit_history(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when any immutable Owner Confirm request/decision/execution exists."""
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND kind IN (%s) LIMIT 1"
+        % ",".join("?" * len(OWNER_AUDIT_EVENTS)),
+        (task_id, *OWNER_AUDIT_EVENTS),
     ).fetchone()
     return row is not None
 

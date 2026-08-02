@@ -425,6 +425,30 @@ def test_unknown_status_is_refused_before_any_sibling_field_lands(client):
     assert after["title"] == before["title"]
 
 
+def test_invalid_status_transition_rolls_back_every_sibling_and_event(client):
+    """The reviewed {assignee, running} exploit is request-atomic, not prevalidated only."""
+    task_id = make_task(client)
+    before = task_of(client, task_id)
+    before_events = events_of(client, task_id)
+
+    response = client.patch(
+        f"{API}/tasks/{task_id}",
+        json={
+            "assignee": "default",
+            "status": "running",
+            "priority": 91,
+            "title": "must roll back",
+            "body": "must also roll back",
+        },
+    )
+
+    assert response.status_code == 400, response.text
+    after = task_of(client, task_id)
+    for field in ("assignee", "status", "priority", "title", "body"):
+        assert after[field] == before[field]
+    assert events_of(client, task_id) == before_events
+
+
 def test_empty_title_is_refused_before_the_status_lands(client):
     task_id = make_task(client)
     before_task = task_of(client, task_id)

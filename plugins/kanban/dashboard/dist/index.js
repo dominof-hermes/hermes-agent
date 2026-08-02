@@ -97,8 +97,7 @@
     "integrating", "done", "blocked",
   ];
   const BLOCKABLE_STATUSES = new Set([
-    "ready", "running", "review", "ready_for_push", "integrating",
-    "ready_for_deploy", "owner_confirm_required",
+    "ready", "running", "review", "integrating",
   ]);
   const COMPLETABLE_STATUSES = new Set(["ready", "running", "blocked"]);
 
@@ -115,6 +114,9 @@
   // — and project into the single OC Required column.
   const OWNER_GATE_STATUSES = new Set([
     "ready_for_push", "ready_for_deploy", OWNER_CONFIRM_REQUIRED,
+  ]);
+  const OWNER_CONTAINED_STATUSES = new Set([
+    "ready_for_push", "ready_for_deploy", OWNER_CONFIRM_REQUIRED, OWNER_CONFIRMED,
   ]);
   const OC_COMPACT_LABEL = {
     owner_confirm_required: "OC Required",
@@ -171,6 +173,9 @@
     //     request is decidable, and only through the confirmation dialog
     //     (see moveTask) — never as a bare status PATCH.
     if (task.status === OWNER_CONFIRMED) return false;
+    if (OWNER_GATE_STATUSES.has(task.status)) {
+      return targetStatus === OWNER_CONFIRMED && ocDecidable(task);
+    }
     if (targetStatus === OWNER_CONFIRMED) {
       return ocDecidable(task);
     }
@@ -759,6 +764,8 @@
     // is only ever an Approve *shortcut* into the same dialog — never a
     // direct status write.
     const [ownerDecision, setOwnerDecision] = useState(null);
+    const [ownerDecisionAnnouncement, setOwnerDecisionAnnouncement] = useState("");
+    const ownerDecisionInvokerRef = useRef(null);
     const handleDragStart = useCallback(function (taskId) { setDraggingTaskId(taskId); }, []);
     const handleDragEnd = useCallback(function () { setDraggingTaskId(null); }, []);
     // Per-task event counter incremented whenever the WS stream reports
@@ -773,6 +780,16 @@
     const wsRef = useRef(null);
     const wsBackoffRef = useRef(1000);
     const wsClosedRef = useRef(false);
+
+    // Keep success announcements bounded: assistive technology gets a stable
+    // status region long enough to announce it, then stale copy is cleared.
+    useEffect(function () {
+      if (!ownerDecisionAnnouncement) return undefined;
+      const timer = window.setTimeout(function () {
+        setOwnerDecisionAnnouncement("");
+      }, 6000);
+      return function () { window.clearTimeout(timer); };
+    }, [ownerDecisionAnnouncement]);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -989,7 +1006,18 @@
 
     // Open the owner decision dialog. This is the only entry point for all
     // three decisions; there is no direct-write path in the client.
+    const closeOwnerDecision = useCallback(function () {
+      setOwnerDecision(null);
+      window.setTimeout(function () {
+        if (ownerDecisionInvokerRef.current && ownerDecisionInvokerRef.current.focus) {
+          ownerDecisionInvokerRef.current.focus();
+        }
+        ownerDecisionInvokerRef.current = null;
+      }, 0);
+    }, []);
+
     const requestOwnerDecision = useCallback(function (taskId, decision) {
+      ownerDecisionInvokerRef.current = document.activeElement;
       setOwnerDecision({ taskId: taskId, decision: decision || "approve" });
     }, []);
 
@@ -1016,14 +1044,17 @@
           body: JSON.stringify(body),
         },
       ).then(function () {
-        setOwnerDecision(null);
+        setOwnerDecisionAnnouncement(
+          `대표 승인 결정 완료: ${OC_DECISION_LABEL[form.decision] || form.decision}`
+        );
+        closeOwnerDecision();
         loadBoard();
       }).catch(function (err) {
         setError("대표 승인 결정 실패: " + parseApiErrorMessage(err));
-        setOwnerDecision(null);
+        closeOwnerDecision();
         loadBoard();
       });
-    }, [board, loadBoard]);
+    }, [board, closeOwnerDecision, loadBoard]);
 
     const clearSelected = useCallback(function () {
       setSelectedIds(new Set());
@@ -1119,7 +1150,9 @@
         if (!filteredBoard || !filteredBoard.columns) return next;
         const order = [];
         for (const col of filteredBoard.columns) {
-          for (const t of col.tasks || []) order.push(t.id);
+          for (const t of col.tasks || []) {
+            if (!OWNER_CONTAINED_STATUSES.has(t.status)) order.push(t.id);
+          }
         }
         const anchor = lastSelectedId;
         if (!anchor || anchor === toId) {
@@ -1144,7 +1177,9 @@
       if (!filteredBoard || !filteredBoard.columns) return;
       const next = new Set();
       for (const col of filteredBoard.columns) {
-        for (const t of col.tasks || []) next.add(t.id);
+        for (const t of col.tasks || []) {
+          if (!OWNER_CONTAINED_STATUSES.has(t.status)) next.add(t.id);
+        }
       }
       setSelectedIds(next);
       if (next.size > 0) {
@@ -1157,15 +1192,18 @@
       if (!filteredBoard || !filteredBoard.columns) return;
       const col = filteredBoard.columns.find(function (c) { return c.name === columnName; });
       if (!col) return;
-      const allSelected = col.tasks && col.tasks.length > 0 && col.tasks.every(function (t) { return selectedIds.has(t.id); });
+      const selectable = (col.tasks || []).filter(function (t) {
+        return !OWNER_CONTAINED_STATUSES.has(t.status);
+      });
+      const allSelected = selectable.length > 0 && selectable.every(function (t) { return selectedIds.has(t.id); });
       const next = new Set(selectedIds);
       if (allSelected) {
-        for (const t of col.tasks || []) next.delete(t.id);
+        for (const t of selectable) next.delete(t.id);
       } else {
-        for (const t of col.tasks || []) next.add(t.id);
+        for (const t of selectable) next.add(t.id);
       }
       setSelectedIds(next);
-      if (col.tasks && col.tasks.length > 0) setLastSelectedId(col.tasks[0].id);
+      if (selectable.length > 0) setLastSelectedId(selectable[0].id);
     }, [filteredBoard, selectedIds]);
 
     const applyBulk = useCallback(function (patch, confirmMsg) {
@@ -1432,6 +1470,12 @@
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
         }),
+        h("div", {
+          className: "sr-only hermes-kanban-oc-success-status",
+          role: "status",
+          "aria-live": "polite",
+          "aria-atomic": "true",
+        }, ownerDecisionAnnouncement),
         ownerDecision ? (function () {
           const all = boardData.columns.reduce(
             function (acc, c) { return acc.concat(c.tasks); }, []);
@@ -1440,7 +1484,7 @@
           return h(OwnerDecisionDialog, {
             task: target,
             initialDecision: ownerDecision.decision,
-            onCancel: function () { setOwnerDecision(null); },
+            onCancel: closeOwnerDecision,
             onSubmit: function (form) { submitOwnerDecision(target, form); },
           });
         })() : null,
@@ -1552,6 +1596,35 @@
   // the dedicated owner-decision endpoint with `expected_status` + `binding`
   // so the server can compare-and-swap and reject a stale binding.
   // -------------------------------------------------------------------------
+  function trapDialogTabKey(dialog, e) {
+    if (!dialog || !e || e.key !== "Tab") return false;
+    const focusable = Array.prototype.filter.call(
+      dialog.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), '
+        + 'select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
+      ),
+      function (node) { return node.offsetParent !== null; },
+    );
+    if (focusable.length === 0) {
+      e.preventDefault();
+      dialog.focus();
+      return true;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+      return true;
+    }
+    if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+      return true;
+    }
+    return false;
+  }
+
   function OwnerDecisionDialog(props) {
     const task = props.task;
     const oc = (task && task.owner_confirm) || {};
@@ -1560,6 +1633,7 @@
     const [holdUntil, setHoldUntil] = useState("");
     const [busy, setBusy] = useState(false);
     const firstRef = useRef(null);
+    const dialogRef = useRef(null);
 
     useEffect(function () {
       if (firstRef.current) firstRef.current.focus();
@@ -1591,13 +1665,22 @@
     return h("div", {
       className: "hermes-kanban-dialog-backdrop",
       onClick: function (e) { if (e.target === e.currentTarget) props.onCancel(); },
-      onKeyDown: function (e) { if (e.key === "Escape") props.onCancel(); },
+      onKeyDown: function (e) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          props.onCancel();
+          return;
+        }
+        trapDialogTabKey(dialogRef.current, e);
+      },
     },
       h("form", {
+        ref: dialogRef,
         className: "hermes-kanban-dialog hermes-kanban-oc-dialog",
         role: "dialog",
         "aria-modal": "true",
         "aria-label": "대표 승인 결정",
+        tabIndex: -1,
         onSubmit: submit,
       },
         h("div", { className: "hermes-kanban-dialog-title" },
@@ -3247,7 +3330,7 @@
     },
       h("div", { className: "hermes-kanban-column-header",
                  title: colHelp || "" },
-        h(Checkbox, {
+        !props.ownerZone ? h(Checkbox, {
           className: "hermes-kanban-col-check",
           title: "Select all tasks in this column",
           "aria-label": `Select all tasks in ${colLabel || props.column.name}`,
@@ -3256,7 +3339,7 @@
             if (props.selectAllInColumn) props.selectAllInColumn(props.column.name);
           },
           onClick: function (e) { e.stopPropagation(); },
-        }),
+        }) : null,
         h("span", { className: cn("hermes-kanban-dot", COLUMN_DOT[props.column.name]), "aria-hidden": "true" }),
         h("span", { className: "hermes-kanban-column-label" },
           colLabel || props.column.name),
@@ -3501,7 +3584,7 @@
         props.draggingSource ? "hermes-kanban-card--dragging-source" : "",
         stalenessClass(t),
       ),
-      draggable: true,
+      draggable: !OWNER_CONTAINED_STATUSES.has(t.status),
       role: "listitem",
       "aria-labelledby": titleId,
       onDragStart: handleDragStart,
@@ -3509,7 +3592,7 @@
       h(Card, null,
         h(CardContent, { className: "hermes-kanban-card-content" },
           h("div", { className: "hermes-kanban-card-row" },
-            h("label", {
+            !OWNER_CONTAINED_STATUSES.has(t.status) ? h("label", {
               className: "hermes-kanban-card-check-wrap",
               title: tx(i18n, "selectForBulk", "Select for bulk actions"),
               onClick: function (e) { e.stopPropagation(); },
@@ -3521,7 +3604,7 @@
                 onClick: function (e) { e.stopPropagation(); },
                 "aria-label": `Select task ${t.id}`,
               }),
-            ),
+            ) : null,
             h("span", { className: "hermes-kanban-card-id",
                         title: `Task id: ${t.id}. Use this id with kanban_show, /kanban show, or hermes kanban show.` }, t.id),
             t.warnings && t.warnings.count > 0
@@ -3596,7 +3679,7 @@
             h("span", { className: "hermes-kanban-ago",
                         title: t.created_at ? `Created ${t.created_at}` : "" },
               timeAgo ? timeAgo(t.created_at) : ""),
-            h("select", {
+            !OWNER_CONTAINED_STATUSES.has(t.status) ? h("select", {
               className: "hermes-kanban-card-move",
               defaultValue: "",
               "aria-label": `Move task ${t.id}`,
@@ -3610,19 +3693,12 @@
               h("option", { value: "" }, "Move to…"),
               COLUMN_ORDER.filter(function (status) {
                 if (status === t.status || status === "running") return false;
-                // Owner Confirm containment: a Confirmed card offers no moves
-                // at all, and Confirmed is offered only when the bound request
-                // is decidable (selecting it opens the dialog, never a PATCH).
-                if (t.status === OWNER_CONFIRMED) return false;
-                if (status === OWNER_CONFIRMED) return ocDecidable(t);
-                if (status === "blocked" && !BLOCKABLE_STATUSES.has(t.status)) return false;
-                if (status === "done" && !COMPLETABLE_STATUSES.has(t.status)) return false;
-                return true;
+                return canMoveTaskToStatus(t, status);
               }).map(function (status) {
                 return h("option", { key: status, value: status },
                   getColumnLabel(i18n, status) || status);
               }),
-            ),
+            ) : null,
           ),
         ),
       ),
@@ -4858,6 +4934,7 @@
   function StatusActions(props) {
     const { t } = useI18n();
     const task = props.task;
+    const generalActionsAllowed = !OWNER_CONTAINED_STATUSES.has(task.status);
     const [specifyBusy, setSpecifyBusy] = useState(false);
     const [specifyMsg, setSpecifyMsg] = useState(null);
     const [decomposeBusy, setDecomposeBusy] = useState(false);
@@ -4955,23 +5032,20 @@
 
     return h("div", null,
       h("div", { className: "hermes-kanban-actions" },
-        specifyButton,
-        decomposeButton,
-        b("→ triage",  { status: "triage" },   task.status !== "triage"),
-        b("→ ready",   { status: "ready" },    task.status !== "ready"),
-        // No direct → running button: /tasks/:id PATCH rejects status=running
-        // with 400 (issue #19535). Tasks enter running only through the
-        // dispatcher's claim_task path, which atomically creates the run row,
-        // claim lock, and worker process metadata.
-        b(tx(t, "block", "Block"),     { status: "blocked" },
-          BLOCKABLE_STATUSES.has(task.status),
-          getDestructiveConfirm(t, "blocked")),
-        b(tx(t, "unblock", "Unblock"),   { status: "ready" },    task.status === "blocked"),
-        b(tx(t, "complete", "Complete"),  { status: "done" },
-          COMPLETABLE_STATUSES.has(task.status),
-          getDestructiveConfirm(t, "done")),
-        b(tx(t, "archive", "Archive"),   { status: "archived" }, task.status !== "archived",
-          getDestructiveConfirm(t, "archived")),
+        generalActionsAllowed ? h(React.Fragment, null,
+          specifyButton,
+          decomposeButton,
+          b("→ triage",  { status: "triage" },   task.status !== "triage"),
+          b("→ ready",   { status: "ready" },    task.status !== "ready"),
+          // No direct → running button: /tasks/:id PATCH rejects status=running.
+          b(tx(t, "block", "Block"), { status: "blocked" },
+            BLOCKABLE_STATUSES.has(task.status), getDestructiveConfirm(t, "blocked")),
+          b(tx(t, "unblock", "Unblock"), { status: "ready" }, task.status === "blocked"),
+          b(tx(t, "complete", "Complete"), { status: "done" },
+            COMPLETABLE_STATUSES.has(task.status), getDestructiveConfirm(t, "done")),
+          b(tx(t, "archive", "Archive"), { status: "archived" },
+            task.status !== "archived", getDestructiveConfirm(t, "archived"))
+        ) : null,
       ),
       specifyMsg ? h("div", {
         className: specifyMsg.ok

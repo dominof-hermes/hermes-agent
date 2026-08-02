@@ -436,6 +436,40 @@ def test_reject_reason_is_scrubbed(kanban_home):
 
 
 @pytest.mark.parametrize(
+    "gate", ["ready_for_push", "ready_for_deploy", "owner_confirm_required"]
+)
+def test_generic_block_cannot_escape_a_typed_owner_gate(kanban_home, gate):
+    """Exact reviewed exploit: gate -> block -> unblock -> claim stays closed."""
+    kinds = {
+        "ready_for_push": "product_release",
+        "ready_for_deploy": "product_release",
+        "owner_confirm_required": "customer_report",
+    }
+    with kb.connect() as conn:
+        task_id = gated_task(conn, status=gate, oc_kind=kinds[gate])
+        before_events = event_rows(conn, task_id)
+
+        assert kb.block_task(conn, task_id, reason="generic escape") is False
+        assert kb.get_task(conn, task_id).status == gate
+        assert kb.unblock_task(conn, task_id) is False
+        assert kb.claim_task(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == gate
+        assert event_rows(conn, task_id) == before_events
+
+
+def test_unblock_cannot_ready_a_blocked_card_with_owner_audit(kanban_home):
+    """Defense in depth also protects legacy/corrupt blocked owner-audit rows."""
+    with kb.connect() as conn:
+        task_id = gated_task(conn)
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (task_id,))
+        before_events = event_rows(conn, task_id)
+
+        assert kb.unblock_task(conn, task_id) is False
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert event_rows(conn, task_id) == before_events
+
+
+@pytest.mark.parametrize(
     "broken",
     [
         {"card": owner_card(why="")},

@@ -1186,10 +1186,9 @@ def test_repeated_late_stage_block_routes_to_triage(kanban_home):
         kb.claim_task(conn, t)
         assert kb.block_task(conn, t, reason="approval issue", kind="needs_input")
         assert kb.unblock_task(conn, t)
-        conn.execute(
-            "UPDATE tasks SET status = 'ready_for_deploy' WHERE id = ?",
-            (t,),
-        )
+        # Use an ordinary late stage. Typed owner gates are intentionally not
+        # generic-blockable: doing so enabled gate -> block -> unblock -> claim.
+        conn.execute("UPDATE tasks SET status = 'integrating' WHERE id = ?", (t,))
         conn.commit()
 
         assert kb.block_task(conn, t, reason="approval issue again", kind="needs_input")
