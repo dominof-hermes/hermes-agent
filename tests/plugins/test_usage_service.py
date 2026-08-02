@@ -140,3 +140,111 @@ print('지금이면 통과')
 
     assert result["available"] is False
     assert all(row["coach"] == "UNAVAILABLE" for row in result["providers"])
+
+
+def test_collect_usage_dashboard_uses_fresh_public_snapshot(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    snapshot = home / "usage" / "usage-p0.json"
+    snapshot.parent.mkdir(parents=True)
+    expected = {
+        "available": True,
+        "providers": [
+            {
+                "provider": "Claude",
+                "current_usage": [{"window": "7d", "used_percent": 6.0}],
+                "reset_at": [{"window": "7d", "at": "2026-08-07T07:59:00Z"}],
+                "coach": "PASS",
+                "last_updated": "2026-08-02T02:10:18Z",
+            },
+            {
+                "provider": "Codex",
+                "current_usage": [{"window": "7d", "used_percent": 13.0}],
+                "reset_at": [{"window": "7d", "at": "2026-08-08T03:37:18Z"}],
+                "coach": "PASS",
+                "last_updated": "2026-08-02T02:10:20Z",
+            },
+        ],
+    }
+    snapshot.write_text(json.dumps(expected), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        usage_service,
+        "_resolve_verified_tools",
+        lambda: (_ for _ in ()).throw(RuntimeError("container has no provider tools")),
+    )
+
+    assert usage_service.collect_usage_dashboard(timeout=5) == expected
+
+
+def test_collect_usage_dashboard_rejects_stale_or_expanded_snapshot(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    snapshot = home / "usage" / "usage-p0.json"
+    snapshot.parent.mkdir(parents=True)
+    payload = {
+        "available": True,
+        "providers": [
+            {
+                "provider": "Claude",
+                "current_usage": "UNAVAILABLE",
+                "reset_at": "UNAVAILABLE",
+                "coach": "UNAVAILABLE",
+                "last_updated": "UNAVAILABLE",
+                "accountEmail": "must-not-cross-boundary@example.com",
+            }
+        ],
+    }
+    snapshot.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        usage_service,
+        "_resolve_verified_tools",
+        lambda: (_ for _ in ()).throw(RuntimeError("container has no provider tools")),
+    )
+
+    expanded = usage_service.collect_usage_dashboard(timeout=5)
+    assert expanded["available"] is False
+    assert "accountEmail" not in json.dumps(expanded)
+
+    huge = {
+        "available": True,
+        "providers": [
+            {
+                "provider": provider,
+                "current_usage": [{"window": "7d", "used_percent": 10**400}],
+                "reset_at": "UNAVAILABLE",
+                "coach": "UNAVAILABLE",
+                "last_updated": "UNAVAILABLE",
+            }
+            for provider in ("Claude", "Codex")
+        ],
+    }
+    snapshot.write_text(json.dumps(huge), encoding="utf-8")
+    malformed_number = usage_service.collect_usage_dashboard(timeout=5)
+    assert malformed_number["available"] is False
+
+    safe = {
+        "available": False,
+        "providers": [
+            {
+                "provider": "Claude",
+                "current_usage": "UNAVAILABLE",
+                "reset_at": "UNAVAILABLE",
+                "coach": "UNAVAILABLE",
+                "last_updated": "UNAVAILABLE",
+            },
+            {
+                "provider": "Codex",
+                "current_usage": "UNAVAILABLE",
+                "reset_at": "UNAVAILABLE",
+                "coach": "UNAVAILABLE",
+                "last_updated": "UNAVAILABLE",
+            },
+        ],
+    }
+    snapshot.write_text(json.dumps(safe), encoding="utf-8")
+    old = snapshot.stat().st_mtime - usage_service.SNAPSHOT_MAX_AGE_SECONDS - 1
+    os.utime(snapshot, (old, old))
+
+    stale = usage_service.collect_usage_dashboard(timeout=5)
+    assert stale["available"] is False
+    assert all(row["last_updated"] == "UNAVAILABLE" for row in stale["providers"])

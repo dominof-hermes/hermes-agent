@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import platform
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,8 @@ CODEXBAR_SHA256 = {
 }
 USAGE_COACH_COMMIT = "bcfe3beaea457c247a624e73481444e4f2e287ec"
 USAGE_COACH_SHA256 = "1e1cfd400d8493b2f1ea888e9a3ffa51ebe463022fa53e0d2b919b3bb8cf9298"
+SNAPSHOT_MAX_AGE_SECONDS = 600
+PUBLIC_ROW_KEYS = {"provider", "current_usage", "reset_at", "coach", "last_updated"}
 
 
 def _unavailable(provider: str) -> dict[str, Any]:
@@ -197,11 +201,83 @@ def _provider_row(
         return _unavailable(provider)
 
 
+def _valid_usage_list(value: Any) -> bool:
+    if value == "UNAVAILABLE":
+        return True
+    if not isinstance(value, list) or not value:
+        return False
+    for item in value:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"window", "used_percent"}
+            or not isinstance(item["window"], str)
+        ):
+            return False
+        used = item["used_percent"]
+        if not isinstance(used, (int, float)) or isinstance(used, bool):
+            return False
+        try:
+            if not math.isfinite(float(used)):
+                return False
+        except (OverflowError, ValueError):
+            return False
+    return True
+
+
+def _valid_reset_list(value: Any) -> bool:
+    if value == "UNAVAILABLE":
+        return True
+    return bool(value) and isinstance(value, list) and all(
+        isinstance(item, dict)
+        and set(item) == {"window", "at"}
+        and isinstance(item["window"], str)
+        and isinstance(item["at"], str)
+        and bool(item["at"])
+        for item in value
+    )
+
+
+def _read_public_snapshot() -> dict[str, Any] | None:
+    root = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    path = root / "usage" / "usage-p0.json"
+    try:
+        age = time.time() - path.stat().st_mtime
+        if age < -60 or age > SNAPSHOT_MAX_AGE_SECONDS:
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or set(data) != {"available", "providers"}:
+            return None
+        rows = data["providers"]
+        if not isinstance(data["available"], bool) or not isinstance(rows, list) or len(rows) != 2:
+            return None
+        if {row.get("provider") for row in rows if isinstance(row, dict)} != {"Claude", "Codex"}:
+            return None
+        for row in rows:
+            if (
+                not isinstance(row, dict)
+                or set(row) != PUBLIC_ROW_KEYS
+                or row["coach"] not in {"PASS", "STOP", "UNAVAILABLE"}
+                or not isinstance(row["last_updated"], str)
+                or not _valid_usage_list(row["current_usage"])
+                or not _valid_reset_list(row["reset_at"])
+            ):
+                return None
+        measured = any(row["current_usage"] != "UNAVAILABLE" for row in rows)
+        if data["available"] != measured:
+            return None
+        return data
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def collect_usage_dashboard(*, timeout: int = 45) -> dict[str, Any]:
     """Return the P0 public shape; failures remain data, never HTTP errors."""
     try:
         codexbar, coach = _resolve_verified_tools()
     except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        snapshot = _read_public_snapshot()
+        if snapshot is not None:
+            return snapshot
         rows = [_unavailable(provider) for provider in PROVIDERS]
     else:
         rows = [
