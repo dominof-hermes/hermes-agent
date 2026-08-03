@@ -1,0 +1,76 @@
+openapi: 3.1.0
+info:
+  title: Zeus Executive Status Action
+  version: 0.1.0
+  description: Read-only live operational status from the canonical DAOS Kanban read model.
+servers:
+  - url: https://ax.dominof.com
+paths:
+  /executive/status:
+    get:
+      operationId: getExecutiveStatus
+      summary: Get current executive operational status
+      description: Returns live read-only operational facts. It performs no strategy or mutation.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: board_slug
+          in: query
+          required: false
+          description: Canonical board slug.
+          schema:
+            type: string
+            default: geumhwa-ai-dx
+            minLength: 1
+            maxLength: 64
+            pattern: '^[a-z0-9][a-z0-9_-]{0,63}$'
+      responses:
+        '200':
+          description: Current bounded executive status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutiveStatus'
+        '400':
+          description: Invalid or unavailable board read.
+        '401':
+          description: Missing or invalid bearer credential.
+        '503':
+          description: Sanitized temporary read failure.
+components:
+  securitySchemes:
+    BearerAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: 'Send the server-issued credential as: Bearer <token>'
+  schemas:
+    ExecutiveStatus:
+      type: object
+      additionalProperties: true
+      required:
+        - board
+        - tasks
+        - workers
+        - usage
+        - blockers
+        - owner_gate
+      properties:
+        board:
+          type: object
+          additionalProperties: true
+        tasks:
+          type: object
+          additionalProperties: true
+        workers:
+          type: object
+          additionalProperties: true
+        usage:
+          type: object
+          additionalProperties: true
+        blockers:
+          type: object
+          additionalProperties: true
+        owner_gate:
+          type: object
+          additionalProperties: true
