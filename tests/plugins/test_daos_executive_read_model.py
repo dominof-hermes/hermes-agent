@@ -6,9 +6,15 @@ and the existing Usage P0 service — no snapshot DB, no second source of truth.
 
 These tests pin the properties an executive interface must never violate:
 
-* the four status axes stay distinct and are never inferred from each other,
+* responses expose the owner's flat field contract, with ``UNAVAILABLE`` (never
+  ``None``/``0``/``""``) for anything the canonical schema does not record,
+* the status axes stay distinct and are never inferred from each other,
 * RUNNING requires a verified worker receipt *and* a fresh heartbeat,
-* missing canonical data surfaces as UNAVAILABLE rather than zero / PASS,
+* workflow counts reconcile with the board's own task count, and an unmapped
+  column forces MISMATCH rather than a silently short count,
+* lane, owner-confirm and product-output remain UNAVAILABLE until a canonical
+  field exists — tenant is not a Product Lane, a needs_input block is not an
+  owner confirmation, and a generic completion is not a product output,
 * nothing from the sensitive-projection denylist can reach a response.
 """
 
@@ -100,6 +106,21 @@ def _mk_task(conn, title="Ship the executive interface", **over):
     return task_id
 
 
+def _insert_raw_task(conn, task_id, *, title="Raw card", status="review", **over):
+    """Insert a card with an exact id/status, including statuses outside the kernel enum."""
+    row = {
+        "id": task_id, "title": title, "status": status, "priority": 0,
+        "created_at": NOW - 3600, "workspace_kind": "scratch",
+    }
+    row.update(over)
+    conn.execute(
+        f"INSERT INTO tasks ({','.join(row)}) VALUES ({','.join('?' * len(row))})",
+        tuple(row.values()),
+    )
+    conn.commit()
+    return task_id
+
+
 def _model(**over):
     kw = {
         "clock": lambda: NOW,
@@ -118,6 +139,18 @@ def _running_card(conn, **run_over):
     run_id = _insert_run(conn, tid, **run_over)
     _set_task(conn, tid, current_run_id=run_id)
     return tid, run_id
+
+
+def _walk(value, path="$"):
+    """Yield (path, value) for every leaf in a JSON-able structure."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _walk(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _walk(item, f"{path}[{index}]")
+    else:
+        yield path, value
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +197,10 @@ def test_workflow_status_never_implies_execution_status(kanban_home):
         conn.close()
 
     assert summary["workflow_status"] == "RUNNING"
-    assert summary["execution"]["execution_status"] == "NOT_RUNNING"
-    assert summary["execution"]["active_worker"] == "UNAVAILABLE"
+    assert summary["workflow_source_status"] == "running"
+    assert summary["execution_status"] == "NOT_RUNNING"
+    assert summary["active_worker"] == "UNAVAILABLE"
+    assert summary["canonical_receipt"] is False
     assert summary["consistency_status"] == "MISMATCH"
     assert summary["data_quality"] in ("PARTIAL", "UNVERIFIED")
 
@@ -180,8 +215,9 @@ def test_assignee_alone_never_becomes_running(kanban_home):
         conn.close()
 
     assert summary["assignment_status"] == "ASSIGNED"
-    assert summary["execution"]["execution_status"] == "NOT_RUNNING"
-    assert summary["execution"]["last_heartbeat_at"] == "UNAVAILABLE"
+    assert summary["execution_status"] == "NOT_RUNNING"
+    assert summary["last_heartbeat_at"] == "UNAVAILABLE"
+    assert summary["canonical_receipt"] is False
 
 
 def test_tmux_shell_session_alone_is_not_running(kanban_home):
@@ -194,8 +230,9 @@ def test_tmux_shell_session_alone_is_not_running(kanban_home):
     finally:
         conn.close()
 
-    assert summary["execution"]["execution_status"] == "NOT_RUNNING"
-    assert summary["execution"]["worker_receipt_verified"] is False
+    assert summary["execution_status"] == "NOT_RUNNING"
+    assert summary["canonical_receipt"] is False
+    assert summary["external_process_detected"] == "UNAVAILABLE"
     assert "tmux-daos-pane-3" not in json.dumps(summary)
 
 
@@ -212,16 +249,14 @@ def test_running_requires_receipt_process_and_fresh_heartbeat(kanban_home):
     finally:
         conn.close()
 
-    ex = summary["execution"]
-    assert ex["execution_status"] == "RUNNING"
-    assert ex["worker_receipt_verified"] is True
-    assert ex["process_verified"] is True
-    assert ex["last_heartbeat_at"] == NOW - 60
-    assert ex["heartbeat_age_seconds"] == 60
-    assert ex["heartbeat_basis"] == "heartbeat"
-    assert ex["source_freshness"] == "FRESH"
-    assert ex["data_quality"] == "MEASURED"
-    assert ex["active_worker"] != "UNAVAILABLE"
+    assert summary["execution_status"] == "RUNNING"
+    assert summary["canonical_receipt"] is True
+    assert summary["process_verified"] is True
+    assert summary["last_heartbeat_at"] == NOW - 60
+    assert summary["heartbeat_age_seconds"] == 60
+    assert summary["heartbeat_basis"] == "heartbeat"
+    assert summary["source_freshness"] == "FRESH"
+    assert summary["active_worker"] != "UNAVAILABLE"
 
 
 def test_dead_process_with_open_run_is_not_running(kanban_home):
@@ -232,9 +267,9 @@ def test_dead_process_with_open_run_is_not_running(kanban_home):
     finally:
         conn.close()
 
-    ex = summary["execution"]
-    assert ex["execution_status"] == "NOT_RUNNING"
-    assert ex["process_verified"] is False
+    assert summary["execution_status"] == "NOT_RUNNING"
+    assert summary["process_verified"] is False
+    assert summary["canonical_receipt"] is True
 
 
 def test_unknown_process_probe_is_unverified_not_running(kanban_home):
@@ -245,10 +280,8 @@ def test_unknown_process_probe_is_unverified_not_running(kanban_home):
     finally:
         conn.close()
 
-    ex = summary["execution"]
-    assert ex["execution_status"] == "UNVERIFIED"
-    assert ex["process_verified"] == "UNAVAILABLE"
-    assert ex["data_quality"] == "UNVERIFIED"
+    assert summary["execution_status"] == "UNVERIFIED"
+    assert summary["process_verified"] == "UNAVAILABLE"
 
 
 def test_external_claim_without_canonical_receipt_is_unverified(kanban_home):
@@ -261,10 +294,190 @@ def test_external_claim_without_canonical_receipt_is_unverified(kanban_home):
     finally:
         conn.close()
 
-    ex = summary["execution"]
-    assert ex["execution_status"] == "UNVERIFIED"
-    assert ex["worker_receipt_verified"] is False
-    assert ex["active_worker"] == "UNAVAILABLE"
+    assert summary["execution_status"] == "UNVERIFIED"
+    assert summary["canonical_receipt"] is False
+    assert summary["external_process_detected"] == "UNAVAILABLE"
+    assert summary["active_worker"] == "UNAVAILABLE"
+
+
+def test_external_process_detection_is_unavailable_without_a_bound_source(kanban_home):
+    """With no process source bound, detection stays UNAVAILABLE and is declared."""
+    conn = _conn()
+    try:
+        tid = _mk_task(conn, title="Assigned, no receipt")
+        _set_task(conn, tid, status="ready")
+    finally:
+        conn.close()
+    summary = _model().get_task_summary(tid)
+    assert summary["external_process_detected"] == "UNAVAILABLE"
+    assert summary["execution_status"] == "NOT_RUNNING"
+    gaps = {gap["field"] for gap in summary["source_gaps"]}
+    assert "external_process_source" in gaps
+
+
+class _StubProcessSource:
+    """Deterministic injected process source for execution-truth tests."""
+
+    def __init__(self, evidence):
+        self.evidence = evidence
+        self.calls = []
+
+    def evidence_for(self, **kwargs):
+        self.calls.append(kwargs)
+        if isinstance(self.evidence, Exception):
+            raise self.evidence
+        return self.evidence
+
+
+def test_live_external_process_without_receipt_is_unverified(kanban_home):
+    """Hector's Geumhwa case: real live process, task_runs=0 — not NOT_RUNNING."""
+    conn = _conn()
+    try:
+        tid = _mk_task(conn, title="External Athena card")
+        _set_task(conn, tid, status="ready", workspace_kind="worktree",
+                  workspace_path="/tmp/workspace-under-test")
+    finally:
+        conn.close()
+
+    source = _StubProcessSource(erm.ProcessEvidence(
+        available=True, detected=True, observed_at=NOW, count_class="MULTIPLE",
+        evidence_class="WORKSPACE_BOUND_WORKER_PROCESS", source="stub",
+    ))
+    summary = _model(process_source=source).get_task_summary(tid)
+
+    assert summary["canonical_receipt"] is False
+    assert summary["external_process_detected"] is True
+    assert summary["execution_status"] == "UNVERIFIED"
+    assert summary["active_worker"] == "UNAVAILABLE"
+    assert summary["external_process_evidence"]["count_class"] == "MULTIPLE"
+    # Never a native RUNNING claim, and no workspace path leaks.
+    assert "/tmp/workspace-under-test" not in json.dumps(summary)
+
+
+def test_absent_external_process_leaves_the_canonical_verdict(kanban_home):
+    conn = _conn()
+    try:
+        tid = _mk_task(conn, title="Idle card")
+        _set_task(conn, tid, status="ready", workspace_kind="worktree",
+                  workspace_path="/tmp/workspace-under-test")
+    finally:
+        conn.close()
+    source = _StubProcessSource(erm.ProcessEvidence(
+        available=True, detected=False, observed_at=NOW, count_class="NONE",
+        evidence_class="NONE", source="stub"))
+    summary = _model(process_source=source).get_task_summary(tid)
+    assert summary["external_process_detected"] is False
+    assert summary["execution_status"] == "NOT_RUNNING"
+
+
+def test_broken_process_source_never_fabricates_execution(kanban_home):
+    conn = _conn()
+    try:
+        tid = _mk_task(conn, title="Card")
+        _set_task(conn, tid, status="ready")
+    finally:
+        conn.close()
+    summary = _model(
+        process_source=_StubProcessSource(RuntimeError("boom"))).get_task_summary(tid)
+    assert summary["external_process_detected"] == "UNAVAILABLE"
+    assert summary["execution_status"] == "NOT_RUNNING"
+
+
+def test_native_receipt_is_not_decided_by_the_process_source(kanban_home):
+    """A canonical receipt is judged on its own evidence, not on a process scan."""
+    conn = _conn()
+    try:
+        tid, _ = _running_card(conn, last_heartbeat_at=NOW - 10)
+    finally:
+        conn.close()
+    source = _StubProcessSource(erm.ProcessEvidence(
+        available=True, detected=True, observed_at=NOW, count_class="ONE",
+        evidence_class="WORKSPACE_BOUND_WORKER_PROCESS", source="stub"))
+    summary = _model(process_source=source).get_task_summary(tid)
+    assert summary["execution_status"] == "RUNNING"
+    assert source.calls == []
+
+
+# -- the shipped detector ---------------------------------------------------
+
+
+def _workspace_source(rows, **over):
+    kw = {"clock": lambda: NOW, "process_lister": lambda: list(rows)}
+    kw.update(over)
+    return erm.WorkspaceProcessSource(**kw)
+
+
+def _evidence(source, path="/tmp/ws", kind="worktree", task="t_abc12345"):
+    return source.evidence_for(board="default", public_task_id=task,
+                               workspace_kind=kind, workspace_path=path)
+
+
+def test_workspace_detector_matches_approved_worker_in_the_bound_workspace(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    source = _workspace_source([
+        {"pid": 111, "name": "claude", "exe": "/usr/bin/claude", "cwd": str(ws)},
+    ])
+    evidence = _evidence(source, path=str(ws))
+    assert evidence.detected is True
+    assert evidence.count_class == "ONE"
+    assert evidence.evidence_class == "WORKSPACE_BOUND_WORKER_PROCESS"
+    # Only existence/freshness crosses the boundary.
+    assert "111" not in json.dumps(evidence.as_dict())
+    assert str(ws) not in json.dumps(evidence.as_dict())
+
+
+def test_workspace_detector_ignores_shells_and_multiplexers(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    source = _workspace_source([
+        {"pid": 1, "name": "tmux", "exe": "/usr/bin/tmux", "cwd": str(ws)},
+        {"pid": 2, "name": "bash", "exe": "/bin/bash", "cwd": str(ws)},
+        {"pid": 3, "name": "vim", "exe": "/usr/bin/vim", "cwd": str(ws)},
+    ])
+    evidence = _evidence(source, path=str(ws))
+    assert evidence.detected is False
+    assert evidence.count_class == "NONE"
+
+
+def test_workspace_detector_requires_the_exact_workspace_binding(tmp_path):
+    ws = tmp_path / "ws"
+    other = tmp_path / "elsewhere"
+    ws.mkdir()
+    other.mkdir()
+    source = _workspace_source([
+        {"pid": 9, "name": "claude", "exe": "/usr/bin/claude", "cwd": str(other)},
+    ])
+    assert _evidence(source, path=str(ws)).detected is False
+
+
+def test_workspace_detector_reports_unavailable_without_a_binding(tmp_path):
+    source = _workspace_source([
+        {"pid": 9, "name": "claude", "exe": "/usr/bin/claude", "cwd": str(tmp_path)},
+    ])
+    evidence = source.evidence_for(board="default", public_task_id="t_abc12345",
+                                   workspace_kind="scratch", workspace_path=None)
+    assert evidence.detected == "UNAVAILABLE"
+    assert evidence.evidence_class == "NO_WORKSPACE_BINDING"
+
+
+def test_workspace_detector_is_unavailable_when_the_scan_fails(tmp_path):
+    def _boom():
+        raise RuntimeError("no psutil")
+
+    source = _workspace_source([], process_lister=_boom)
+    assert _evidence(source, path=str(tmp_path)).detected == "UNAVAILABLE"
+
+
+def test_workspace_detector_scan_is_bounded(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    rows = [{"pid": i, "name": "idle", "exe": "/bin/idle", "cwd": "/"} for i in range(50)]
+    rows.append({"pid": 999, "name": "claude", "exe": "/usr/bin/claude", "cwd": str(ws)})
+    source = _workspace_source(rows, scan_max=10)
+    # The match sits beyond the scan bound, so it is simply not observed —
+    # the scan never runs unbounded to find it.
+    assert _evidence(source, path=str(ws)).detected is False
 
 
 @pytest.mark.parametrize(
@@ -282,28 +495,60 @@ def test_heartbeat_freshness_transitions_are_deterministic(
     conn = _conn()
     try:
         tid, _ = _running_card(conn, last_heartbeat_at=NOW - age, started_at=NOW - age - 60)
-        ex = _model().get_task_summary(tid)["execution"]
+        summary = _model().get_task_summary(tid)
     finally:
         conn.close()
 
-    assert ex["execution_status"] == expected_status
-    assert ex["source_freshness"] == expected_freshness
-    assert ex["heartbeat_age_seconds"] == age
+    assert summary["execution_status"] == expected_status
+    assert summary["source_freshness"] == expected_freshness
+    assert summary["heartbeat_age_seconds"] == age
 
 
-def test_missing_heartbeat_falls_back_to_run_start_and_is_marked_derived(kanban_home):
+def test_missing_heartbeat_can_never_be_running(kanban_home):
+    """A receipt and a live process are not enough — an actual heartbeat is mandatory.
+
+    The run's start time is not a heartbeat and must never be substituted for one.
+    """
     conn = _conn()
     try:
         tid, _ = _running_card(conn, last_heartbeat_at=None, started_at=NOW - 30)
-        ex = _model().get_task_summary(tid)["execution"]
+        summary = _model().get_task_summary(tid)
     finally:
         conn.close()
 
-    assert ex["last_heartbeat_at"] == "UNAVAILABLE"
-    assert ex["heartbeat_basis"] == "run_started"
-    assert ex["heartbeat_age_seconds"] == 30
-    assert ex["data_quality"] == "DERIVED"
-    assert ex["execution_status"] == "RUNNING"
+    assert summary["canonical_receipt"] is True
+    assert summary["process_verified"] is True
+    assert summary["last_heartbeat_at"] == "UNAVAILABLE"
+    assert summary["heartbeat_age_seconds"] == "UNAVAILABLE"
+    assert summary["heartbeat_basis"] == "UNAVAILABLE"
+    assert summary["execution_status"] == "UNVERIFIED"
+    assert summary["data_quality"] in ("UNVERIFIED", "PARTIAL")
+    assert summary["active_worker"] == "UNAVAILABLE"
+
+
+def test_running_is_unreachable_without_all_three_facts(kanban_home):
+    """Exhaustive conjunction check: receipt AND live process AND real heartbeat."""
+    conn = _conn()
+    try:
+        no_receipt = _mk_task(conn, title="claim only")
+        _set_task(conn, no_receipt, status="running", claim_lock="c", worker_pid=None)
+
+        no_heartbeat, _ = _running_card(conn, last_heartbeat_at=None)
+        dead_process, _ = _running_card(conn, last_heartbeat_at=NOW - 5)
+        healthy, _ = _running_card(conn, last_heartbeat_at=NOW - 5)
+    finally:
+        conn.close()
+
+    alive = _model()
+    dead = _model(pid_probe=lambda pid: False)
+    unknown = _model(pid_probe=lambda pid: None)
+
+    assert alive.get_task_summary(no_receipt)["execution_status"] == "UNVERIFIED"
+    assert alive.get_task_summary(no_heartbeat)["execution_status"] == "UNVERIFIED"
+    assert dead.get_task_summary(dead_process)["execution_status"] == "NOT_RUNNING"
+    assert unknown.get_task_summary(healthy)["execution_status"] == "UNVERIFIED"
+    # Only the full conjunction yields RUNNING.
+    assert alive.get_task_summary(healthy)["execution_status"] == "RUNNING"
 
 
 def test_blocked_completed_and_failed_execution_states(kanban_home):
@@ -313,26 +558,29 @@ def test_blocked_completed_and_failed_execution_states(kanban_home):
 
         blocked = _mk_task(conn, title="Blocked card")
         _set_task(conn, blocked, status="blocked", block_kind="capability")
-        assert model.get_task_summary(blocked)["execution"]["execution_status"] == "BLOCKED"
+        blocked_summary = model.get_task_summary(blocked)
+        assert blocked_summary["execution_status"] == "BLOCKED"
+        assert blocked_summary["blocked"] is True
+        assert blocked_summary["blocker_summary"] == "capability"
 
         done = _mk_task(conn, title="Done card")
         _set_task(conn, done, status="done", completed_at=NOW - 300)
         _insert_run(conn, done, status="done", outcome="completed",
                     ended_at=NOW - 300, claim_lock=None)
-        assert model.get_task_summary(done)["execution"]["execution_status"] == "COMPLETED"
+        assert model.get_task_summary(done)["execution_status"] == "COMPLETED"
 
         failed = _mk_task(conn, title="Crashed card")
         _set_task(conn, failed, status="ready")
         _insert_run(conn, failed, status="crashed", outcome="crashed",
                     ended_at=NOW - 100, claim_lock=None)
-        assert model.get_task_summary(failed)["execution"]["execution_status"] == "FAILED"
+        assert model.get_task_summary(failed)["execution_status"] == "FAILED"
 
         released = _mk_task(conn, title="Reclaimed card")
         _set_task(conn, released, status="ready")
         _insert_run(conn, released, status="released", outcome="reclaimed",
                     ended_at=NOW - 50, claim_lock=None)
         s = model.get_task_summary(released)
-        assert s["execution"]["execution_status"] == "NOT_RUNNING"
+        assert s["execution_status"] == "NOT_RUNNING"
         assert s["assignment_status"] == "RELEASED"
     finally:
         conn.close()
@@ -351,16 +599,15 @@ def test_card_overrides_only_from_structured_fields(kanban_home):
     finally:
         conn.close()
 
-    ex = summary["execution"]
-    assert ex["runtime_deadline_at"] == (NOW - 600) + 1800
+    assert summary["runtime_deadline_at"] == (NOW - 600) + 1800
     # Prose in the body must never move the thresholds.
     assert summary["thresholds"]["expected_heartbeat_interval_seconds"] == "UNAVAILABLE"
     assert summary["thresholds"]["expected_output_interval_seconds"] == "UNAVAILABLE"
     # A structured runtime cap may only tighten the policy stall threshold.
     assert summary["thresholds"]["stall_threshold_seconds"] == 1800
     assert summary["thresholds"]["stall_threshold_basis"] == "kanban.tasks.max_runtime_seconds"
-    assert summary["deadline_at"] == "UNAVAILABLE"
-    assert ex["execution_status"] == "RUNNING"
+    assert summary["deadline"] == "UNAVAILABLE"
+    assert summary["execution_status"] == "RUNNING"
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +649,7 @@ def test_sanitizer_redacts_secrets_paths_and_injection():
     assert erm.REDACTED in out
 
 
-def test_identifier_sanitizer_keeps_real_worker_and_lane_identities():
+def test_identifier_sanitizer_keeps_real_worker_identities():
     """Board identities are frequently non-ASCII — redacting them destroys the answer."""
     for identity in ("아테나", "제우스", "athena", "daos-executive-source-writer",
                      "L1_PLATFORM", "feat/daos-exec-mcp"):
@@ -503,13 +750,9 @@ def test_no_denylisted_content_reaches_any_response(adversarial_board):
 
 def test_task_summary_omits_raw_body_comments_and_run_detail(adversarial_board):
     summary = _model().get_task_summary(adversarial_board)
-    assert "body" not in summary
-    assert "comments" not in summary
-    assert "result" not in summary
-    assert "run_summary" not in summary
-    assert "error" not in summary
-    assert "metadata" not in summary
-    assert "attachments" not in summary
+    for banned in ("body", "comments", "result", "run_summary", "error", "metadata",
+                   "attachments", "workspace_path", "session_id", "worker_pid"):
+        assert banned not in summary, banned
     # Only the sanitized executive projection survives.
     assert summary["objective"].startswith("Lane Alpha:")
     assert erm.REDACTED in summary["objective"]
@@ -523,8 +766,95 @@ def test_untrusted_data_marking_present_on_every_response(adversarial_board):
 
 
 # ---------------------------------------------------------------------------
-# Envelope / freshness discipline
+# Response contract: flat owner fields, no nulls
 # ---------------------------------------------------------------------------
+
+
+def test_list_tasks_records_carry_the_exact_required_flat_fields(adversarial_board):
+    page = _model().list_tasks(board_slug="default")
+    assert page["tasks"], "expected at least one card"
+    for record in page["tasks"]:
+        missing = [f for f in erm.REQUIRED_TASK_FIELDS if f not in record]
+        assert not missing, missing
+        assert record["public_task_id"].startswith("t_")
+        assert record["workflow_status"] in erm.WORKFLOW_STATUSES + ("UNAVAILABLE",)
+        assert record["execution_status"] in erm.EXECUTION_STATUSES
+        assert record["assignment_status"] in erm.ASSIGNMENT_STATUSES
+        assert isinstance(record["blocked"], bool)
+        assert isinstance(record["updated_at"], int)
+
+
+def test_list_tasks_page_exposes_limit_cursor_and_has_more(kanban_home):
+    conn = _conn()
+    try:
+        for i in range(4):
+            tid = kb.create_task(conn, title=f"Card {i}", assignee="athena")
+            _set_task(conn, tid, created_at=NOW - (100 - i))
+    finally:
+        conn.close()
+
+    first = _model().list_tasks(limit=2)
+    assert first["limit"] == 2
+    assert first["has_more"] is True
+    assert first["next_cursor"] != "UNAVAILABLE"
+
+    second = _model().list_tasks(limit=2, cursor=first["next_cursor"])
+    assert second["has_more"] is False
+    assert second["next_cursor"] == "UNAVAILABLE"
+
+
+def test_list_boards_records_carry_the_exact_required_flat_fields(adversarial_board):
+    payload = _model().list_boards()
+    assert payload["boards"]
+    for record in payload["boards"]:
+        missing = [f for f in erm.REQUIRED_BOARD_FIELDS if f not in record]
+        assert not missing, missing
+        assert record["board_id"] == record["board_slug"]
+        assert record["board_name"] != ""
+        assert record["measured_at"] == NOW
+        assert record["project_status"] in erm.PROJECT_STATUSES
+    blob = json.dumps(payload)
+    assert "db_path" not in blob and ".hermes" not in blob
+
+
+def test_worker_records_carry_the_exact_required_flat_fields(adversarial_board):
+    payload = _model().get_worker_status(board_slug="default")
+    assert payload["workers"]
+    for record in payload["workers"]:
+        missing = [f for f in erm.REQUIRED_WORKER_FIELDS if f not in record]
+        assert not missing, missing
+        assert record["worker_id"].startswith("wkr_")
+        assert record["execution_status"] in erm.WORKER_EXECUTION_STATUSES
+        assert isinstance(record["canonical_receipt"], bool)
+        assert record["external_process_detected"] == "UNAVAILABLE"
+
+
+def test_usage_summary_carries_the_exact_required_fields(adversarial_board):
+    payload = _model().get_usage_and_output_summary(board_slug="default")
+    missing = [f for f in erm.REQUIRED_USAGE_FIELDS if f not in payload]
+    assert not missing, missing
+
+
+def test_no_response_field_is_ever_null(adversarial_board):
+    for payload in _all_responses(_model(), adversarial_board):
+        nulls = [path for path, value in _walk(payload) if value is None]
+        assert not nulls, nulls
+
+
+def test_no_response_field_is_ever_null_on_an_empty_board(kanban_home):
+    model = _model()
+    payloads = [
+        model.list_boards(),
+        model.get_board_summary("default"),
+        model.get_lane_status("default", "anything"),
+        model.list_tasks(),
+        model.get_worker_status(),
+        model.get_owner_confirm_queue(),
+        model.get_usage_and_output_summary(),
+    ]
+    for payload in payloads:
+        nulls = [path for path, value in _walk(payload) if value is None]
+        assert not nulls, nulls
 
 
 def test_every_response_carries_the_freshness_envelope(adversarial_board):
@@ -536,71 +866,278 @@ def test_every_response_carries_the_freshness_envelope(adversarial_board):
         assert isinstance(payload["source_gaps"], list)
 
 
-def test_unknown_values_are_never_zero_or_empty_string(adversarial_board):
-    summary = _model().get_task_summary(adversarial_board)
-    for key in ("deadline_at", "owner_decision", "product"):
-        assert summary[key] not in (0, "", None)
-    assert summary["owner_decision"]["decision_status"] in erm.OWNER_DECISION_STATUSES + ("UNAVAILABLE",)
-
-
 # ---------------------------------------------------------------------------
-# Boards / lanes
+# Workflow normalisation + parity
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_board_fails_closed(kanban_home):
-    with pytest.raises(erm.SafeReadError) as exc:
-        _model().get_board_summary("no-such-board")
-    assert exc.value.code == "UNKNOWN_BOARD"
-
-
-def test_malformed_board_slug_fails_closed(kanban_home):
-    with pytest.raises(erm.SafeReadError):
-        _model().get_board_summary("../../etc/passwd")
-
-
-def test_unknown_lane_fails_closed_not_empty_success(adversarial_board):
-    with pytest.raises(erm.SafeReadError) as exc:
-        _model().get_lane_status("default", "lane-that-does-not-exist")
-    assert exc.value.code == "UNKNOWN_LANE"
-
-
-def test_lane_status_uses_canonical_grouping_only(adversarial_board):
-    lane = _model().get_lane_status("default", "alpha")
-    assert lane["lane"]["lane_id"] == "alpha"
-    assert lane["lane"]["lane_source"] == "kanban.tasks.tenant"
-    # Attributes with no canonical source stay honest.
-    assert lane["lane"]["owner"] == "UNAVAILABLE"
-    assert lane["lane"]["status_basis"] == "DERIVED_FROM_TASK_COUNTS"
-    assert "athena" in lane["lane"]["assigned_ai"]
-    assert lane["task_counts"]["total"] >= 1
-
-
-def test_lane_source_gap_reported_when_no_lane_grouping(kanban_home):
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("triage", "BACKLOG"),
+        ("todo", "BACKLOG"),
+        ("backlog", "BACKLOG"),
+        ("scheduled", "BACKLOG"),
+        ("ready", "READY"),
+        ("running", "RUNNING"),
+        ("review", "REVIEW"),
+        ("ready_for_push", "INTEGRATION"),
+        ("integrating", "INTEGRATION"),
+        ("blocked", "BLOCKED"),
+        ("done", "DONE"),
+    ],
+)
+def test_workflow_normalisation_is_deterministic(kanban_home, raw, expected):
     conn = _conn()
     try:
-        kb.create_task(conn, title="No lane card", assignee="athena")
+        tid = _insert_raw_task(conn, f"t_norm{abs(hash(raw)) % 10**6:06d}", status=raw)
     finally:
         conn.close()
-    board = _model().get_board_summary("default")
-    assert board["product_lanes"] == []
-    assert any("lane" in gap["field"] for gap in board["source_gaps"])
-    assert board["data_quality"] in ("PARTIAL", "UNAVAILABLE")
+    summary = _model().get_task_summary(tid)
+    assert summary["workflow_status"] == expected
+    # Zeus can always compare against the board's own column value.
+    assert summary["workflow_source_status"] == raw
 
 
-def test_list_boards_never_exposes_db_paths(adversarial_board):
-    payload = _model().list_boards()
-    blob = json.dumps(payload)
-    assert "db_path" not in blob
-    assert ".hermes" not in blob
-    board = payload["boards"][0]
-    assert board["board_id"] == "default"
-    assert board["task_counts"]["total"] >= 1
-    assert board["last_activity_at"] != 0
+def test_workflow_counts_reconcile_with_the_board_task_count(kanban_home):
+    conn = _conn()
+    try:
+        for index, status in enumerate(
+            ["scheduled"] * 3 + ["review"] * 2 + ["ready_for_push", "done", "blocked"]
+        ):
+            _insert_raw_task(conn, f"t_parity{index:04d}", status=status)
+    finally:
+        conn.close()
+
+    payload = _model().get_board_summary("default")
+    counts = payload["workflow_counts"]
+    assert sum(counts.values()) == payload["task_count"] == 8
+    assert counts["BACKLOG"] == 3
+    assert counts["REVIEW"] == 2
+    assert counts["INTEGRATION"] == 1
+    assert counts["DONE"] == 1
+    assert counts["BLOCKED"] == 1
+    assert counts["UNAVAILABLE"] == 0
+    assert payload["consistency_status"] == "CONSISTENT"
+
+
+def test_unknown_active_status_forces_mismatch_never_a_short_count(kanban_home):
+    conn = _conn()
+    try:
+        _insert_raw_task(conn, "t_known001", status="review")
+        _insert_raw_task(conn, "t_weird001", status="quantum_superposition")
+    finally:
+        conn.close()
+
+    payload = _model().get_board_summary("default")
+    counts = payload["workflow_counts"]
+    assert sum(counts.values()) == payload["task_count"] == 2
+    assert counts["UNAVAILABLE"] == 1
+    assert payload["consistency_status"] == "MISMATCH"
+    assert payload["data_quality"] == "PARTIAL"
+    assert "quantum_superposition" in payload["unmapped_workflow_statuses"]
+
+
+def test_board_summary_mismatch_is_reported_not_corrected(kanban_home):
+    conn = _conn()
+    try:
+        tid = _mk_task(conn, title="Ghost runner")
+        # Card says running, and points at a run that already ended.
+        run_id = _insert_run(conn, tid, status="done", outcome="completed",
+                             ended_at=NOW - 10, claim_lock=None)
+        _set_task(conn, tid, status="running", current_run_id=run_id, worker_pid=4242)
+    finally:
+        conn.close()
+    payload = _model().get_board_summary("default")
+    assert payload["consistency_status"] == "MISMATCH"
+    assert payload["data_quality"] in ("PARTIAL", "UNVERIFIED", "STALE")
 
 
 # ---------------------------------------------------------------------------
-# Bounded pagination
+# Source gaps the owner directed us to keep honest
+# ---------------------------------------------------------------------------
+
+
+def test_tenant_is_never_projected_as_a_product_lane(adversarial_board):
+    """tenant values (TRACK_*, PRODUCT_LANE_1, alpha) are not canonical Product Lanes."""
+    board = _model().get_board_summary("default")
+    assert board["product_lanes"] == []
+    assert board["product_lane"] == "UNAVAILABLE"
+    assert any(gap["field"] == "product_lane" for gap in board["source_gaps"])
+
+    page = _model().list_tasks(board_slug="default")
+    for record in page["tasks"]:
+        assert record["lane"] == "UNAVAILABLE"
+    assert "alpha" not in json.dumps(_model().get_task_summary(adversarial_board))
+
+
+def test_get_lane_status_returns_an_honest_unavailable_response(adversarial_board):
+    payload = _model().get_lane_status("default", "alpha")
+    assert payload["lane"] == "UNAVAILABLE"
+    assert payload["lane_status"] == "UNAVAILABLE"
+    assert payload["owner"] == "UNAVAILABLE"
+    assert payload["assigned_ai"] == "UNAVAILABLE"
+    assert payload["task_counts"] == "UNAVAILABLE"
+    assert payload["data_quality"] == "UNAVAILABLE"
+    assert any(gap["field"] == "product_lane" for gap in payload["source_gaps"])
+
+
+def test_lane_filter_is_reported_unsupported_not_silently_applied(adversarial_board):
+    page = _model().list_tasks(board_slug="default", lane="alpha")
+    assert page["tasks"] == []
+    assert page["data_quality"] == "UNAVAILABLE"
+    assert page["unsupported_filters"]["lane"] == "NO_CANONICAL_SOURCE"
+
+
+def test_owner_confirm_is_never_inferred_from_a_needs_input_block(adversarial_board):
+    summary = _model().get_task_summary(adversarial_board)
+    assert summary["owner_confirm_status"] == "UNAVAILABLE"
+
+    conn = _conn()
+    try:
+        blocked = conn.execute(
+            "SELECT id FROM tasks WHERE block_kind = 'needs_input'").fetchone()["id"]
+    finally:
+        conn.close()
+    gated = _model().get_task_summary(blocked)
+    # The block itself is canonical and still reported; the owner gate is not.
+    assert gated["blocked"] is True
+    assert gated["blocker_summary"] == "needs_input"
+    assert gated["owner_confirm_status"] == "UNAVAILABLE"
+
+    board = _model().get_board_summary("default")
+    assert board["oc_required_count"] == "UNAVAILABLE"
+
+
+def test_owner_confirm_queue_fabricates_nothing(adversarial_board):
+    payload = _model().get_owner_confirm_queue(board_slug="default")
+    assert payload["entries"] == []
+    assert payload["count"] == "UNAVAILABLE"
+    assert payload["data_quality"] == "UNAVAILABLE"
+    assert any(gap["field"] == "owner_confirm_ledger" for gap in payload["source_gaps"])
+    assert payload["queue_basis"] == "UNAVAILABLE"
+    # The declared gap may explain why needs_input is not an owner gate, but no
+    # queue content may be derived from it.
+    entries_blob = json.dumps(payload["entries"])
+    assert "needs_input" not in entries_blob
+    blob = json.dumps({k: v for k, v in payload.items() if k != "source_gaps"})
+    assert "needs_input" not in blob
+    assert "evidence_path" not in blob and "download" not in blob
+
+
+def test_product_output_is_never_inferred_from_a_generic_completion(adversarial_board):
+    summary = _model().get_task_summary(adversarial_board)
+    assert summary["last_product_output_at"] == "UNAVAILABLE"
+    assert summary["product_output_count"] == "UNAVAILABLE"
+    assert summary["product_maturity"] in ("DEFINED", "UNAVAILABLE")
+    gaps = {gap["field"] for gap in summary["source_gaps"]}
+    assert "product_output_event" in gaps
+
+    board = _model().get_board_summary("default")
+    assert board["recent_product_outputs"] == "UNAVAILABLE"
+    assert board["last_product_output_at"] == "UNAVAILABLE"
+
+
+def test_completed_card_still_never_claims_implemented_maturity(kanban_home):
+    conn = _conn()
+    try:
+        tid = _mk_task(conn, title="Completed card")
+        _set_task(conn, tid, status="done", completed_at=NOW - 120)
+        _insert_run(conn, tid, status="done", outcome="completed", ended_at=NOW - 120,
+                    claim_lock=None)
+    finally:
+        conn.close()
+    summary = _model().get_task_summary(tid)
+    assert summary["workflow_status"] == "DONE"
+    assert summary["execution_status"] == "COMPLETED"
+    assert summary["product_maturity"] == "DEFINED"
+    assert summary["last_product_output_at"] == "UNAVAILABLE"
+
+
+def test_usage_output_counters_are_unavailable_not_completion_counts(adversarial_board):
+    payload = _model().get_usage_and_output_summary(board_slug="default")
+    output = payload["output"]
+    assert output["product_output_count"] == "UNAVAILABLE"
+    assert output["last_product_output_at"] == "UNAVAILABLE"
+    assert output["output_recency_seconds"] == "UNAVAILABLE"
+    # Worker/task counts remain canonical and measured.
+    assert output["active_worker_count"] == 1
+    assert output["task_count"] == 2
+    assert "not a measure of delivered product output" in payload["usage_note"].lower()
+
+
+def test_reviewer_and_next_action_have_no_canonical_source(adversarial_board):
+    summary = _model().get_task_summary(adversarial_board)
+    assert summary["reviewer"] == "UNAVAILABLE"
+    assert summary["next_action"] == "UNAVAILABLE"
+    assert summary["deadline"] == "UNAVAILABLE"
+    assert summary["commit"] == "UNAVAILABLE"
+
+
+# ---------------------------------------------------------------------------
+# Task lookup by public id
+# ---------------------------------------------------------------------------
+
+
+def _second_board(name="ops"):
+    kb.init_db(board=name)
+    return kb.connect(board=name)
+
+
+def test_get_task_summary_resolves_by_public_task_id_alone(kanban_home):
+    conn = _second_board()
+    try:
+        tid = _insert_raw_task(conn, "t_onlyonops", title="Ops card", status="review")
+    finally:
+        conn.close()
+
+    summary = _model().get_task_summary(tid)
+    assert summary["public_task_id"] == tid
+    assert summary["board"] == "ops"
+    assert summary["workflow_status"] == "REVIEW"
+
+
+def test_get_task_summary_board_slug_still_disambiguates(kanban_home):
+    conn = _second_board()
+    try:
+        _insert_raw_task(conn, "t_onlyonops", title="Ops card")
+    finally:
+        conn.close()
+    summary = _model().get_task_summary("t_onlyonops", board_slug="ops")
+    assert summary["board"] == "ops"
+
+    with pytest.raises(erm.SafeReadError) as exc:
+        _model().get_task_summary("t_onlyonops", board_slug="default")
+    assert exc.value.code == "UNKNOWN_TASK"
+
+
+def test_duplicate_task_id_across_boards_fails_closed(kanban_home):
+    conn = _conn()
+    try:
+        _insert_raw_task(conn, "t_duplicate1", title="On default")
+    finally:
+        conn.close()
+    conn = _second_board()
+    try:
+        _insert_raw_task(conn, "t_duplicate1", title="On ops")
+    finally:
+        conn.close()
+
+    with pytest.raises(erm.SafeReadError) as exc:
+        _model().get_task_summary("t_duplicate1")
+    assert exc.value.code == "AMBIGUOUS_TASK"
+    # The boards are named so the caller can disambiguate, and nothing is guessed.
+    assert set(exc.value.boards) == {"default", "ops"}
+
+
+def test_unknown_task_fails_closed(kanban_home):
+    with pytest.raises(erm.SafeReadError) as exc:
+        _model().get_task_summary("t_nosuchcard")
+    assert exc.value.code == "UNKNOWN_TASK"
+
+
+# ---------------------------------------------------------------------------
+# Filters and bounded pagination
 # ---------------------------------------------------------------------------
 
 
@@ -618,6 +1155,85 @@ def test_malformed_cursor_fails_closed(adversarial_board):
     assert exc.value.code == "INVALID_CURSOR"
 
 
+def test_cursor_is_opaque_and_signed(kanban_home):
+    import base64
+
+    conn = _conn()
+    try:
+        for i in range(3):
+            tid = kb.create_task(conn, title=f"Card {i}", assignee="athena")
+            _set_task(conn, tid, created_at=NOW - (100 - i))
+    finally:
+        conn.close()
+
+    page = _model().list_tasks(limit=1)
+    cursor = page["next_cursor"]
+    assert cursor != "UNAVAILABLE"
+    assert len(cursor) <= 200
+    # Signed: body and signature, and the body alone is not accepted.
+    body, _, signature = cursor.partition(".")
+    assert body and signature
+    with pytest.raises(erm.SafeReadError) as exc:
+        _model().list_tasks(limit=1, cursor=body)
+    assert exc.value.code == "INVALID_CURSOR"
+
+
+def test_tampered_cursor_is_rejected(kanban_home):
+    import base64
+
+    conn = _conn()
+    try:
+        for i in range(3):
+            tid = kb.create_task(conn, title=f"Card {i}", assignee="athena")
+            _set_task(conn, tid, created_at=NOW - (100 - i))
+    finally:
+        conn.close()
+
+    model = _model()
+    cursor = model.list_tasks(limit=1)["next_cursor"]
+    body, _, signature = cursor.partition(".")
+    raw = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode()
+    forged_body = base64.urlsafe_b64encode(
+        raw.replace(raw.split("|")[0], str(NOW)).encode()).decode().rstrip("=")
+
+    for forged in (f"{forged_body}.{signature}", f"{body}.{signature[:-2]}xy",
+                   f"{body}.", "." + signature):
+        with pytest.raises(erm.SafeReadError) as exc:
+            model.list_tasks(limit=1, cursor=forged)
+        assert exc.value.code == "INVALID_CURSOR"
+
+
+def test_cursor_from_another_filter_context_is_rejected(kanban_home):
+    conn = _conn()
+    try:
+        for i in range(3):
+            tid = kb.create_task(conn, title=f"Card {i}", assignee="athena")
+            _set_task(conn, tid, created_at=NOW - (100 - i))
+    finally:
+        conn.close()
+
+    model = _model()
+    cursor = model.list_tasks(limit=1)["next_cursor"]
+    with pytest.raises(erm.SafeReadError) as exc:
+        model.list_tasks(limit=1, workflow_status="BACKLOG", cursor=cursor)
+    assert exc.value.code == "INVALID_CURSOR"
+
+
+def test_cursor_from_another_server_salt_is_rejected(kanban_home):
+    conn = _conn()
+    try:
+        for i in range(3):
+            tid = kb.create_task(conn, title=f"Card {i}", assignee="athena")
+            _set_task(conn, tid, created_at=NOW - (100 - i))
+    finally:
+        conn.close()
+
+    cursor = _model().list_tasks(limit=1)["next_cursor"]
+    with pytest.raises(erm.SafeReadError) as exc:
+        _model(identity_salt=b"a-different-salt").list_tasks(limit=1, cursor=cursor)
+    assert exc.value.code == "INVALID_CURSOR"
+
+
 def test_malformed_filter_fails_closed(adversarial_board):
     model = _model()
     with pytest.raises(erm.SafeReadError):
@@ -625,14 +1241,68 @@ def test_malformed_filter_fails_closed(adversarial_board):
     with pytest.raises(erm.SafeReadError):
         model.list_tasks(execution_status="NOPE")
     with pytest.raises(erm.SafeReadError):
+        model.list_tasks(workflow_status=["REVIEW", "NOPE"])
+    with pytest.raises(erm.SafeReadError):
         model.list_tasks(updated_since="yesterday")
+
+
+def test_status_filters_accept_bounded_lists_and_single_values(kanban_home):
+    conn = _conn()
+    try:
+        _insert_raw_task(conn, "t_filter001", status="review")
+        _insert_raw_task(conn, "t_filter002", status="ready_for_push")
+        _insert_raw_task(conn, "t_filter003", status="scheduled")
+    finally:
+        conn.close()
+    model = _model()
+
+    single = model.list_tasks(workflow_status="REVIEW")
+    assert [t["public_task_id"] for t in single["tasks"]] == ["t_filter001"]
+
+    both = model.list_tasks(workflow_status=["REVIEW", "INTEGRATION"])
+    assert {t["public_task_id"] for t in both["tasks"]} == {"t_filter001", "t_filter002"}
+
+    execution = model.list_tasks(execution_status=["NOT_RUNNING"])
+    assert len(execution["tasks"]) == 3
+
+
+def test_updated_since_accepts_timezone_aware_iso8601(kanban_home):
+    conn = _conn()
+    try:
+        old = _insert_raw_task(conn, "t_old00001", status="review")
+        new = _insert_raw_task(conn, "t_new00001", status="review")
+        _set_task(conn, old, created_at=NOW - 86_400)
+        _set_task(conn, new, created_at=NOW - 60)
+    finally:
+        conn.close()
+
+    iso = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(NOW - 3600))
+    page = _model().list_tasks(updated_since=iso)
+    assert [t["public_task_id"] for t in page["tasks"]] == ["t_new00001"]
+
+    # Epoch seconds stay supported for programmatic callers.
+    page_epoch = _model().list_tasks(updated_since=NOW - 3600)
+    assert [t["public_task_id"] for t in page_epoch["tasks"]] == ["t_new00001"]
+
+
+def test_naive_iso8601_is_rejected(adversarial_board):
+    with pytest.raises(erm.SafeReadError) as exc:
+        _model().list_tasks(updated_since="2026-08-03T00:00:00")
+    assert exc.value.code == "INVALID_FILTER"
+
+
+def test_owner_confirm_filter_is_reported_unsupported(adversarial_board):
+    page = _model().list_tasks(board_slug="default", owner_confirm_status="OC_REQUIRED")
+    assert page["tasks"] == []
+    assert page["data_quality"] == "UNAVAILABLE"
+    assert page["unsupported_filters"]["owner_confirm_status"] == "NO_CANONICAL_SOURCE"
 
 
 def test_cursor_pagination_is_complete_and_non_overlapping(kanban_home):
     conn = _conn()
     try:
         for i in range(7):
-            tid = kb.create_task(conn, title=f"Card {i}", tenant="alpha", assignee="athena")
+            tid = kb.create_task(conn, title=f"Card {i}", assignee="athena")
             _set_task(conn, tid, created_at=NOW - (100 - i))
     finally:
         conn.close()
@@ -643,12 +1313,59 @@ def test_cursor_pagination_is_complete_and_non_overlapping(kanban_home):
     for _ in range(10):
         page = model.list_tasks(limit=3, cursor=cursor)
         assert len(page["tasks"]) <= 3
-        seen.extend(t["task_id"] for t in page["tasks"])
+        seen.extend(t["public_task_id"] for t in page["tasks"])
         cursor = page["next_cursor"]
         if cursor == "UNAVAILABLE":
             break
     assert len(seen) == 7
     assert len(set(seen)) == 7
+
+
+# ---------------------------------------------------------------------------
+# Boards
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_board_fails_closed(kanban_home):
+    with pytest.raises(erm.SafeReadError) as exc:
+        _model().get_board_summary("no-such-board")
+    assert exc.value.code == "UNKNOWN_BOARD"
+
+
+def test_malformed_board_slug_fails_closed(kanban_home):
+    with pytest.raises(erm.SafeReadError):
+        _model().get_board_summary("../../etc/passwd")
+
+
+def test_board_without_a_database_fails_closed_instead_of_creating_one(kanban_home):
+    """An executive read must never bring a board's ledger into existence."""
+    kb.write_board_metadata("empty-board", name="Empty")
+    db_path = kb.kanban_db_path(board="empty-board")
+    assert not db_path.exists()
+
+    with pytest.raises(erm.SafeReadError) as exc:
+        _model().get_board_summary("empty-board")
+    assert exc.value.code == "BOARD_UNAVAILABLE"
+    assert not db_path.exists()
+
+    listed = _model().list_boards()
+    entry = next(b for b in listed["boards"] if b["board_id"] == "empty-board")
+    assert entry["task_count"] == "UNAVAILABLE"
+    assert entry["data_quality"] == "UNAVAILABLE"
+    assert not db_path.exists()
+
+
+def test_board_summary_joins_the_operations_chain(adversarial_board):
+    payload = _model().get_board_summary("default")
+    assert payload["board_id"] == "default"
+    assert payload["overall_status"] in erm.WORKFLOW_STATUSES
+    assert payload["workflow_counts"]["RUNNING"] >= 1
+    assert payload["execution_counts"]["RUNNING"] >= 1
+    assert payload["active_worker_count"] == 1
+    assert payload["blocked_task_count"] >= 1
+    assert payload["stalled_task_count"] == 0
+    assert payload["usage_summary"]["available"] in (True, False, "UNAVAILABLE")
+    assert payload["last_activity_at"] >= NOW - 60
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +1383,6 @@ def test_worker_status_hides_pid_session_and_raw_run_id(adversarial_board):
     assert worker["role"] == "athena"
     assert worker["process_verified"] is True
     assert worker["session_verified"] in (True, False, "UNAVAILABLE")
-    assert worker["execution_status"] in erm.WORKER_EXECUTION_STATUSES
 
 
 def test_worker_ids_are_stable_and_non_reversible(adversarial_board):
@@ -700,84 +1416,7 @@ def test_ended_run_reports_stopped_worker(kanban_home):
 
 
 # ---------------------------------------------------------------------------
-# Owner confirm queue
-# ---------------------------------------------------------------------------
-
-
-def test_owner_confirm_queue_is_partial_projection_with_declared_gap(adversarial_board):
-    payload = _model().get_owner_confirm_queue(board_slug="default")
-    assert payload["data_quality"] == "PARTIAL"
-    assert payload["entries"], "needs_input blocks are the only canonical owner gate"
-    entry = payload["entries"][0]
-    assert entry["decision_status"] == "REQUIRED"
-    assert entry["owner_confirm"] == "OC_REQUIRED"
-    assert entry["evidence_count"] >= 0
-    assert entry["evidence_body"] == "UNAVAILABLE" if "evidence_body" in entry else True
-    assert entry["artifact_destination_category"] in erm.DESTINATION_CATEGORIES
-    assert entry["rollback_summary"] == "UNAVAILABLE"
-    assert entry["deadline_at"] == "UNAVAILABLE"
-    assert entry["waiting_seconds"] >= 0
-    assert any(gap["field"] == "owner_confirm_ledger" for gap in payload["source_gaps"])
-    blob = json.dumps(payload)
-    assert "evidence_path" not in blob and "download" not in blob
-
-
-def test_owner_confirm_status_filter_is_bounded(adversarial_board):
-    model = _model()
-    with pytest.raises(erm.SafeReadError):
-        model.get_owner_confirm_queue(status="MAYBE")
-    approved = model.get_owner_confirm_queue(board_slug="default", status="APPROVED")
-    # No canonical approval record exists — that is UNAVAILABLE, not "none pending".
-    assert approved["entries"] == []
-    assert approved["data_quality"] == "UNAVAILABLE"
-
-
-# ---------------------------------------------------------------------------
-# Product output / maturity
-# ---------------------------------------------------------------------------
-
-
-def test_product_output_is_derived_from_completion_receipts(adversarial_board):
-    summary = _model().get_task_summary(adversarial_board)
-    product = summary["product"]
-    assert product["last_output_at"] == NOW - 20
-    assert product["output_count"] == 1
-    assert set(product["output_categories"]) <= set(erm.OUTPUT_CATEGORIES)
-    assert product["maturity"] in erm.PRODUCT_MATURITIES
-    blob = json.dumps(product)
-    assert "report.pdf" not in blob and "/tmp" not in blob
-
-
-def test_unrepresented_maturity_levels_are_never_claimed(kanban_home):
-    conn = _conn()
-    try:
-        tid = _mk_task(conn, title="Just defined")
-    finally:
-        conn.close()
-    summary = _model().get_task_summary(tid)
-    assert summary["product"]["maturity"] == "DEFINED"
-    assert summary["product"]["maturity_basis"] == "DERIVED"
-    gaps = {gap["field"] for gap in summary["source_gaps"]}
-    assert "product_maturity" in gaps
-
-
-def test_safe_branch_identifier_but_no_paths(kanban_home):
-    conn = _conn()
-    try:
-        good = _mk_task(conn, title="Branch card")
-        _set_task(conn, good, branch_name="feat/daos-exec-mcp")
-        bad = _mk_task(conn, title="Path card")
-        _set_task(conn, bad, branch_name="/home/ubuntu/worktrees/geumhwa/feature")
-    finally:
-        conn.close()
-    model = _model()
-    assert model.get_task_summary(good)["branch"] == "feat/daos-exec-mcp"
-    assert erm.REDACTED in model.get_task_summary(bad)["branch"]
-    assert model.get_task_summary(good)["commit"] == "UNAVAILABLE"
-
-
-# ---------------------------------------------------------------------------
-# Usage + output
+# Usage
 # ---------------------------------------------------------------------------
 
 
@@ -796,18 +1435,21 @@ def test_usage_unavailable_stays_unavailable(adversarial_board):
     assert usage["providers"][0]["current_usage"] == "UNAVAILABLE"
     assert usage["providers"][0]["model"] == "UNAVAILABLE"
     assert usage["data_quality"] == "UNAVAILABLE"
-    assert "performance" not in json.dumps(payload).lower() or payload["usage_note"]
 
 
-def test_usage_and_output_summary_counts_recent_output(adversarial_board):
-    payload = _model().get_usage_and_output_summary(board_slug="default", period="24h")
-    output = payload["output"]
-    assert output["completed_output_count"] == 1
-    assert output["last_output_at"] == NOW - 20
-    assert output["output_recency_seconds"] == 20
-    assert output["active_worker_count"] == 1
-    assert payload["period"] == "24h"
-    assert "not a measure of delivered product output" in payload["usage_note"].lower()
+def test_usage_measured_values_pass_through(adversarial_board):
+    model = _model(usage_collector=lambda: {
+        "available": True,
+        "providers": [
+            {"provider": "Codex", "current_usage": [{"window": "5h", "used_percent": 17.0}],
+             "reset_at": [{"window": "5h", "at": "2026-08-03T22:20:00Z"}],
+             "coach": "PASS", "last_updated": "2026-08-03T22:01:38Z"},
+        ],
+    })
+    usage = model.get_usage_and_output_summary(board_slug="default")["usage"]
+    assert usage["available"] is True
+    assert usage["providers"][0]["coach"] == "PASS"
+    assert usage["data_quality"] == "MEASURED"
 
 
 def test_usage_period_filter_is_bounded(adversarial_board):
@@ -826,41 +1468,6 @@ def test_usage_collector_failure_is_unavailable_not_pass(adversarial_board):
 
 
 # ---------------------------------------------------------------------------
-# Board summary joins
-# ---------------------------------------------------------------------------
-
-
-def test_board_summary_joins_the_operations_chain(adversarial_board):
-    payload = _model().get_board_summary("default")
-    assert payload["board"]["board_id"] == "default"
-    assert payload["overall_status"] in erm.WORKFLOW_STATUSES
-    assert payload["workflow_counts"]["RUNNING"] >= 1
-    assert payload["execution_counts"]["RUNNING"] >= 1
-    assert payload["owner_confirm"]["required_count"] == 1
-    assert payload["active_workers"]["count"] == 1
-    assert payload["blockers"]["count"] >= 1
-    assert payload["stalled"]["count"] == 0
-    assert payload["recent_product_outputs"][0]["at"] == NOW - 20
-    assert payload["usage_summary"]["available"] in (True, False, "UNAVAILABLE")
-    assert payload["last_activity_at"] >= NOW - 60
-
-
-def test_board_summary_mismatch_is_reported_not_corrected(kanban_home):
-    conn = _conn()
-    try:
-        tid = _mk_task(conn, title="Ghost runner")
-        # Card says running, and points at a run that already ended.
-        run_id = _insert_run(conn, tid, status="done", outcome="completed",
-                             ended_at=NOW - 10, claim_lock=None)
-        _set_task(conn, tid, status="running", current_run_id=run_id, worker_pid=4242)
-    finally:
-        conn.close()
-    payload = _model().get_board_summary("default")
-    assert payload["consistency_status"] == "MISMATCH"
-    assert payload["data_quality"] in ("PARTIAL", "UNVERIFIED", "STALE")
-
-
-# ---------------------------------------------------------------------------
 # Read-only guarantee
 # ---------------------------------------------------------------------------
 
@@ -876,24 +1483,6 @@ def test_read_model_connection_is_query_only(adversarial_board):
             conn.execute("CREATE TABLE evil (x INTEGER)")
 
 
-def test_board_without_a_database_fails_closed_instead_of_creating_one(kanban_home):
-    """An executive read must never bring a board's ledger into existence."""
-    kb.write_board_metadata("empty-board", name="Empty")
-    db_path = kb.kanban_db_path(board="empty-board")
-    assert not db_path.exists()
-
-    with pytest.raises(erm.SafeReadError) as exc:
-        _model().get_board_summary("empty-board")
-    assert exc.value.code == "BOARD_UNAVAILABLE"
-    assert not db_path.exists()
-
-    listed = _model().list_boards()
-    entry = next(b for b in listed["boards"] if b["board_id"] == "empty-board")
-    assert entry["task_counts"]["total"] == "UNAVAILABLE"
-    assert entry["data_quality"] == "UNAVAILABLE"
-    assert not db_path.exists()
-
-
 def test_read_model_never_opens_a_writable_handle_on_an_existing_board(
     adversarial_board, monkeypatch,
 ):
@@ -903,7 +1492,7 @@ def test_read_model_never_opens_a_writable_handle_on_an_existing_board(
 
     monkeypatch.setattr(kb, "connect", _boom)
     payload = _model().get_board_summary("default")
-    assert payload["board"]["board_id"] == "default"
+    assert payload["board_id"] == "default"
 
 
 def test_read_model_exposes_no_mutation_helpers():
