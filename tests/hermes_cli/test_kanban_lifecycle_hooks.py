@@ -133,3 +133,75 @@ def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
             conn.close()
     finally:
         mgr._hooks = saved
+
+
+def test_nested_completion_side_effects_are_discarded_on_outer_rollback(
+    kanban_home, captured_hooks
+):
+    """A sibling failure after complete cannot delete scratch or publish hooks."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="atomic", assignee="worker")
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, tid, workspace)
+        before_events = [(e.kind, e.payload) for e in kb.list_events(conn, tid)]
+
+        with pytest.raises(RuntimeError, match="late sibling failure"):
+            with kb.write_txn(conn):
+                assert kb.complete_task(conn, tid, summary="not durable yet")
+                raise RuntimeError("late sibling failure")
+
+        assert kb.get_task(conn, tid).status == "ready"
+        assert [(e.kind, e.payload) for e in kb.list_events(conn, tid)] == before_events
+        assert workspace.exists()
+        assert [e for e in captured_hooks if e[0] == "kanban_task_completed"] == []
+    finally:
+        conn.close()
+
+
+def test_nested_completion_side_effects_run_once_after_outer_commit(
+    kanban_home, captured_hooks
+):
+    """Successful outermost commit drains each irreversible callback once."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="atomic success", assignee="worker")
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, tid, workspace)
+
+        with kb.write_txn(conn):
+            assert kb.complete_task(conn, tid, summary="durable")
+            assert workspace.exists(), "cleanup must not run before COMMIT"
+            assert [e for e in captured_hooks if e[0] == "kanban_task_completed"] == []
+
+        assert not workspace.exists()
+        fired = [e for e in captured_hooks if e[0] == "kanban_task_completed"]
+        assert len(fired) == 1
+        assert fired[0][1]["task_id"] == tid
+    finally:
+        conn.close()
+
+
+def test_after_commit_queues_are_connection_scoped(kanban_home, tmp_path):
+    """A second connection cannot drain or discard the first connection's queue."""
+    first = kb.connect()
+    second = kb.connect(db_path=tmp_path / "second-kanban.db")
+    fired = []
+    try:
+        with pytest.raises(RuntimeError, match="rollback first"):
+            with kb.write_txn(first):
+                kb.run_after_commit(first, fired.append, "first")
+                with kb.write_txn(second):
+                    kb.run_after_commit(second, fired.append, "second")
+                assert fired == ["second"]
+                raise RuntimeError("rollback first")
+        assert fired == ["second"]
+
+        with kb.write_txn(first):
+            kb.run_after_commit(first, fired.append, "first-committed")
+        assert fired == ["second", "first-committed"]
+    finally:
+        first.close()
+        second.close()

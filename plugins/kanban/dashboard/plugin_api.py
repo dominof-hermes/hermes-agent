@@ -39,6 +39,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -1047,11 +1048,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
     board = _resolve_board(board)
     conn = _conn(board=board)
     request_committed = False
+    request_txn = kanban_db.write_txn(conn)
     try:
         # One PATCH is one SQLite transaction. Called domain operations join
-        # this boundary through write_txn's re-entrant participation path, so
-        # no nested operation commits a partial assignee/status/field/event set.
-        kanban_db._execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+        # this explicit boundary, including its rollback-safe after-COMMIT queue.
+        request_txn.__enter__()
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1080,6 +1081,23 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             )
 
         # --- Owner Confirm containment -----------------------------------
+        # Immutable audit history, not the current column, determines whether
+        # generic lifecycle writers are allowed. Only a successful exact
+        # owner-execution event releases the card into post-execution workflow.
+        if (
+            payload.status is not None
+            and payload.status != task.status
+            and payload.status != kanban_db.OWNER_CONFIRMED_STATUS
+            and kanban_db.owner_lifecycle_locked(conn, task_id)
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "owner-audit cards cannot change lifecycle through the generic "
+                    "status API; use the dedicated owner request/decision/execution route"
+                ),
+            )
+
         # The generic status surface must never be an approval path, in
         # either direction:
         #   * INTO ``owner_confirmed`` — that belongs to the dedicated,
@@ -1133,7 +1151,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 raise HTTPException(status_code=404, detail="task not found")
 
         # --- status -------------------------------------------------------
-        if payload.status is not None:
+        if payload.status is not None and payload.status != task.status:
             s = payload.status
             ok = True
             if s == "done":
@@ -1240,16 +1258,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         oc = _owner_confirm_card_state(conn, updated)
         if oc is not None:
             updated_d["owner_confirm"] = oc
-        kanban_db._execute_boundary_with_retry(conn, "COMMIT")
+        request_txn.__exit__(None, None, None)
         request_committed = True
-        kanban_db._check_file_length_invariant(conn)
         return {"task": updated_d}
     finally:
-        if not request_committed and conn.in_transaction:
-            try:
-                conn.execute("ROLLBACK")
-            except sqlite3.OperationalError:
-                pass
+        if not request_committed:
+            request_txn.__exit__(*sys.exc_info())
         conn.close()
 
 
@@ -1431,6 +1445,8 @@ def _set_status_direct(
     (user yanking a stuck worker back to the queue).
     """
     with kanban_db.write_txn(conn):
+        if kanban_db.owner_lifecycle_locked(conn, task_id):
+            return False
         # Snapshot current state so we know whether to close a run.
         prev = conn.execute(
             "SELECT status, current_run_id FROM tasks WHERE id = ?",
@@ -1643,7 +1659,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     # PATCH. Bulk edits must not become a mass-approval or a
                     # mass-bypass path for Level-3 actions.
                     if (
-                        s == kanban_db.OWNER_CONFIRMED_STATUS
+                        (
+                            kanban_db.owner_lifecycle_locked(conn, tid)
+                            and s != task.status
+                        )
+                        or s == kanban_db.OWNER_CONFIRMED_STATUS
+                        or task.status == kanban_db.OWNER_CONFIRMED_STATUS
                         or (
                             task.status in kanban_db.OWNER_CONTAINED_STATUSES
                             and s != task.status

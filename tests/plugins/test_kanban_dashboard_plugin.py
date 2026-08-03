@@ -57,7 +57,9 @@ def kanban_home(tmp_path, monkeypatch):
 def client(kanban_home):
     app = FastAPI()
     app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
-    return TestClient(app)
+    # Exercise real HTTP 500/4xx responses instead of re-raising endpoint
+    # exceptions into the test process. This is required for rollback probes.
+    return TestClient(app, raise_server_exceptions=False)
 
 
 # ---------------------------------------------------------------------------
@@ -1088,6 +1090,160 @@ def test_owner_decision_modal_traps_focus_restores_invoker_and_announces_success
     assert 'role: "status"' in bundle
     assert '"aria-live": "polite"' in bundle
     assert "setOwnerDecisionAnnouncement" in bundle
+    assert 'setOwnerDecisionAnnouncement(failureAnnouncement)' in bundle
+    assert "const failureAnnouncement = ownerDecisionFailureAnnouncement(err);" in bundle
+    assert "}, 6000);" in bundle
+
+
+def test_rejected_owner_card_cannot_patch_triage_ready_then_claim(client):
+    """Exact V3 adversarial laundering chain is closed at API and DB seams."""
+    sha = "8a55ef5555d9ffced33fb93d0b4bd5c4f4f50b65"
+    rollback = "직전 릴리스 태그로 즉시 되돌리고 재검증합니다"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="rejected exact artifact")
+        conn.execute("UPDATE tasks SET status='ready_for_push' WHERE id=?", (task_id,))
+        conn.commit()
+        request = kb.request_owner_confirm(
+            conn, task_id, oc_kind="product_release", artifact_kind="source_sha",
+            artifact_sha=sha, destination="production", rollback=rollback,
+            evidence={
+                stage: {"summary": f"{stage} 단계 검증 근거 완료",
+                        "ref": f"event:{stage}", "artifact_sha": sha}
+                for stage in kb.OWNER_EVIDENCE_STAGES
+            },
+            card={
+                "why": "고객 대상 릴리스라 대표 승인이 필요합니다",
+                "impact": "검색 응답 품질이 전 고객에게 즉시 반영됩니다",
+                "rollback": rollback, "recommendation": "승인 보류",
+                "summary_30s": "품질 개선 릴리스 1건, 되돌리기 준비 완료",
+            },
+        )
+        kb.owner_decide(
+            conn, task_id, decision="reject", expected_status="ready_for_push",
+            binding=request["binding"], reason="추가 검토가 필요합니다",
+        )
+
+    for status in ("triage", "todo", "ready", "review", "scheduled", "done"):
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{task_id}", json={"status": status},
+        )
+        assert response.status_code == 403, (status, response.text)
+
+    bulk = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [task_id], "status": "triage"},
+    )
+    assert bulk.status_code == 200
+    assert bulk.json()["results"] == [
+        {
+            "id": task_id,
+            "ok": False,
+            "error": (
+                "owner decisions are per-card manual actions; "
+                "use POST /tasks/{id}/owner-decision"
+            ),
+        }
+    ]
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert kb.claim_task(conn, task_id) is None
+
+
+def test_patch_done_late_priority_failure_keeps_db_workspace_and_hook(client, monkeypatch):
+    """An exact HTTP 500 rollback leaves no attachment blob, row, run, or hook."""
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "atomic external effects"},
+    ).json()["task"]
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task["id"])
+        workspace = kb.resolve_workspace(current)
+        kb.set_workspace_path(conn, task["id"], workspace)
+        artifact = workspace / "sentinel.txt"
+        artifact.write_text("rollback sentinel", encoding="utf-8")
+        before_events = [(e.kind, e.payload) for e in kb.list_events(conn, task["id"])]
+
+    emitted = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda event, task_id, **fields: emitted.append((event, task_id)),
+    )
+    plugin = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    real_dumps = plugin.json.dumps
+
+    def fail_priority(value, *args, **kwargs):
+        if value == {"priority": 77}:
+            raise RuntimeError("late priority event failure")
+        return real_dumps(value, *args, **kwargs)
+
+    monkeypatch.setattr(plugin.json, "dumps", fail_priority)
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "done",
+            "summary": "must roll back",
+            "metadata": {"artifacts": [str(artifact)]},
+            "priority": 77,
+        },
+    )
+
+    assert response.status_code == 500
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task["id"])
+        assert current.status == "ready"
+        assert current.priority == 0
+        assert kb.latest_run(conn, task["id"]) is None
+        assert kb.list_attachments(conn, task["id"]) == []
+        assert [(e.kind, e.payload) for e in kb.list_events(conn, task["id"])] == before_events
+    attachment_dir = kb.task_attachments_dir(task["id"])
+    assert not attachment_dir.exists() or list(attachment_dir.iterdir()) == []
+    assert workspace.exists()
+    assert artifact.read_text(encoding="utf-8") == "rollback sentinel"
+    assert emitted == []
+
+
+def test_patch_done_success_cleans_workspace_and_fires_hook_once(client, monkeypatch):
+    """Commit preserves final attachment bytes/metadata and leaves no staging file."""
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "atomic success effects"},
+    ).json()["task"]
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task["id"])
+        workspace = kb.resolve_workspace(current)
+        kb.set_workspace_path(conn, task["id"], workspace)
+        artifact = workspace / "sentinel.txt"
+        artifact.write_text("commit sentinel", encoding="utf-8")
+
+    emitted = []
+    monkeypatch.setattr(
+        kb, "_fire_kanban_lifecycle_hook",
+        lambda event, task_id, **fields: emitted.append((event, task_id)),
+    )
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "done",
+            "summary": "durable",
+            "metadata": {"artifacts": [str(artifact)]},
+            "priority": 77,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task["id"])
+        attachments = kb.list_attachments(conn, task["id"])
+        run = kb.latest_run(conn, task["id"])
+        assert current.status == "done"
+        assert current.priority == 77
+        assert len(attachments) == 1
+        assert run is not None
+        persisted = Path(attachments[0].stored_path)
+        assert run.metadata["artifacts"] == [str(persisted)]
+    assert not workspace.exists()
+    assert persisted.read_text(encoding="utf-8") == "commit sentinel"
+    assert list(persisted.parent.iterdir()) == [persisted]
+    assert emitted == [("kanban_task_completed", task["id"])]
 
 
 @pytest.mark.parametrize(

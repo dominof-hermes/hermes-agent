@@ -2434,6 +2434,78 @@ def test_complete_task_rejects_missing_declared_scratch_artifact(kanban_home):
         assert kb.get_task(conn, t).status == "ready"
         assert kb.list_attachments(conn, t) == []
     assert ws.exists(), "failed completion must keep scratch available for retry"
+    attachment_dir = kb.task_attachments_dir(t)
+    assert not attachment_dir.exists() or list(attachment_dir.iterdir()) == []
+
+
+def test_complete_task_copy_failure_rolls_back_without_temporary_or_reference(
+    kanban_home, monkeypatch
+):
+    """A staging write failure cannot commit metadata or leave a partial blob."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unwritable report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        artifact = ws / "report.md"
+        artifact.write_text("deliverable", encoding="utf-8")
+        real_open = Path.open
+
+        def fail_staging_open(path, *args, **kwargs):
+            if path.name.endswith(".completion-tmp"):
+                raise OSError("injected staging write failure")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", fail_staging_open)
+        with pytest.raises(kb.ArtifactPreservationError, match="could not preserve"):
+            kb.complete_task(
+                conn, t, result="report complete",
+                metadata={"artifacts": [str(artifact)]},
+            )
+
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.latest_run(conn, t) is None
+        assert kb.list_attachments(conn, t) == []
+    assert artifact.read_text(encoding="utf-8") == "deliverable"
+    attachment_dir = kb.task_attachments_dir(t)
+    assert not attachment_dir.exists() or list(attachment_dir.iterdir()) == []
+
+
+def test_complete_task_finalization_failure_prevents_broken_committed_reference(
+    kanban_home, monkeypatch
+):
+    """A no-clobber publish failure aborts completion and removes staging."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="publish report")
+        task = kb.get_task(conn, t)
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, t, ws)
+        artifact = ws / "report.md"
+        artifact.write_text("deliverable", encoding="utf-8")
+
+        real_unlink = Path.unlink
+        failed_once = False
+
+        def fail_first_staging_unlink(path, *args, **kwargs):
+            nonlocal failed_once
+            if path.name.endswith(".completion-tmp") and not failed_once:
+                failed_once = True
+                raise OSError("injected post-publish finalization failure")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_first_staging_unlink)
+        with pytest.raises(kb.ArtifactPreservationError, match="could not finalize"):
+            kb.complete_task(
+                conn, t, result="report complete",
+                metadata={"artifacts": [str(artifact)]},
+            )
+
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb.latest_run(conn, t) is None
+        assert kb.list_attachments(conn, t) == []
+    assert artifact.read_text(encoding="utf-8") == "deliverable"
+    attachment_dir = kb.task_attachments_dir(t)
+    assert not attachment_dir.exists() or list(attachment_dir.iterdir()) == []
 
 
 def test_complete_task_preserves_legacy_artifact_path_from_summary(kanban_home):

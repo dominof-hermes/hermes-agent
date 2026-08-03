@@ -12,6 +12,13 @@ const end = bundle.indexOf("\n\n  function OwnerDecisionDialog", start);
 if (start < 0 || end < 0) throw new Error("trapDialogTabKey not found");
 const source = bundle.slice(start, end).trim();
 
+function extractFunction(name, nextMarker) {
+  const functionStart = bundle.indexOf(`function ${name}(`);
+  const functionEnd = bundle.indexOf(nextMarker, functionStart);
+  if (functionStart < 0 || functionEnd < 0) throw new Error(`${name} not found`);
+  return bundle.slice(functionStart, functionEnd).trim();
+}
+
 function harness(activeElement, nodes) {
   const document = { activeElement };
   const trap = new Function("document", `${source}; return trapDialogTabKey;`)(document);
@@ -70,5 +77,31 @@ describe("Owner Confirm decision modal focus trap", () => {
     assert.equal(trap(dialog, event), true);
     assert.equal(event.prevented, true);
     assert.equal(dialog.focused, true);
+  });
+});
+
+describe("Owner Confirm failure announcement", () => {
+  it("returns live-region text without interpreting hostile markup", () => {
+    const parseSource = extractFunction(
+      "parseApiErrorMessage",
+      "\n\n  function ownerDecisionFailureAnnouncement",
+    );
+    const failureSource = extractFunction(
+      "ownerDecisionFailureAnnouncement",
+      "\n\n  // Order matches",
+    );
+    const announce = new Function(
+      `${parseSource}; ${failureSource}; return ownerDecisionFailureAnnouncement;`,
+    )();
+    const hostile = '<img src=x onerror="globalThis.pwned=true">';
+
+    const message = announce(new Error(`500: {"detail":${JSON.stringify(hostile)}}`));
+
+    assert.equal(message, `대표 승인 결정 실패: ${hostile}`);
+    assert.equal(typeof message, "string");
+    assert.equal(globalThis.pwned, undefined);
+    assert.match(bundle, /setOwnerDecisionAnnouncement\(failureAnnouncement\)/);
+    assert.match(bundle, /setTimeout\(function \(\) \{[\s\S]*?\}, 6000\);/);
+    assert.match(bundle, /\}, ownerDecisionAnnouncement\)/);
   });
 });

@@ -469,6 +469,38 @@ def test_unblock_cannot_ready_a_blocked_card_with_owner_audit(kanban_home):
         assert event_rows(conn, task_id) == before_events
 
 
+def test_rejected_card_cannot_be_laundered_through_any_generic_intermediate(kanban_home):
+    """Rejected exact artifact stays on the dedicated owner lifecycle."""
+    with kb.connect() as conn:
+        task_id = gated_task(conn)
+        request = kb.latest_owner_confirm_request(conn, task_id)
+        kb.owner_decide(
+            conn, task_id, decision="reject", expected_status="ready_for_push",
+            binding=request["binding"], reason="추가 검토가 필요합니다",
+        )
+        before_events = event_rows(conn, task_id)
+
+        assert kb.get_task(conn, task_id).status == "blocked"
+        assert kb.unblock_task(conn, task_id) is False
+        assert kb.promote_task(conn, task_id, actor="generic", force=True)[0] is False
+        assert kb.schedule_task(conn, task_id, reason="launder") is False
+        assert kb.block_task(conn, task_id, reason="launder") is False
+        assert kb.complete_task(conn, task_id, result="launder") is False
+        assert kb.recompute_ready(conn) == 0
+
+        # Even if a legacy/external writer already moved to an intermediate,
+        # immutable audit history keeps every dispatcher/specifier seam shut.
+        for status in ("triage", "todo", "ready", "review"):
+            park(conn, task_id, status)
+            assert kb.specify_triage_task(conn, task_id, title="launder") is False
+            assert kb.promote_task(conn, task_id, actor="generic", force=True)[0] is False
+            assert kb.claim_task(conn, task_id) is None
+            assert kb.claim_review_task(conn, task_id) is None
+            assert kb.recompute_ready(conn) == 0
+
+        assert event_rows(conn, task_id) == before_events
+
+
 @pytest.mark.parametrize(
     "broken",
     [
@@ -601,12 +633,15 @@ def test_delete_archived_task_refuses_owner_decision_history(kanban_home):
             expected_status="ready_for_push", binding=recorded["binding"],
             reason="근거 부족",
         )
-        # A rejected card is ordinary blocked work and stays archivable —
-        # archiving preserves every event row.
-        assert kb.archive_task(conn, task_id) is True
+        before = event_rows(conn, task_id)
+        # V4 keeps rejected cards on the dedicated owner lifecycle. Generic
+        # archive cannot turn immutable owner audit into an ordinary tombstone.
+        assert kb.archive_task(conn, task_id) is False
+        assert kb.get_task(conn, task_id).status == "blocked"
 
         assert kb.delete_archived_task(conn, task_id) is False
         assert kb.get_task(conn, task_id) is not None
+        assert event_rows(conn, task_id) == before
         assert any(
             k == kb.OWNER_REJECTED_EVENT
             for _, k, _, _ in event_rows(conn, task_id)

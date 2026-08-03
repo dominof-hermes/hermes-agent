@@ -84,7 +84,7 @@ import sys
 import threading
 import logging
 import time
-from contextvars import ContextVar, Token
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -2546,52 +2546,148 @@ def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
             time.sleep(random.uniform(_BUSY_RETRY_MIN_S, _BUSY_RETRY_MAX_S))
 
 
+@dataclass
+class _WriteTransactionContext:
+    """Per-context side-effect queues for one outermost SQLite transaction."""
+
+    conn: sqlite3.Connection
+    before_commit: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = field(
+        default_factory=list
+    )
+    after_rollback: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = field(
+        default_factory=list
+    )
+    after_commit: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = field(
+        default_factory=list
+    )
+
+
+_WRITE_TRANSACTION_CONTEXTS: ContextVar[tuple[_WriteTransactionContext, ...]] = ContextVar(
+    "hermes_kanban_write_transaction_contexts", default=()
+)
+
+
+def _write_transaction_for(
+    conn: sqlite3.Connection,
+) -> Optional[_WriteTransactionContext]:
+    """Return this execution context's transaction for exactly ``conn``."""
+    for txn in reversed(_WRITE_TRANSACTION_CONTEXTS.get()):
+        if txn.conn is conn:
+            return txn
+    return None
+
+
+def run_after_commit(
+    conn: sqlite3.Connection, callback: Any, /, *args: Any, **kwargs: Any
+) -> None:
+    """Run now when durable, or enqueue on this context's outer transaction.
+
+    The queue is ContextVar-scoped (therefore request/thread/task isolated) and
+    owned by one explicit :func:`write_txn`. Rollback drops it. A raw,
+    untracked transaction is rejected rather than accidentally performing I/O
+    before an unknown caller commits.
+    """
+    txn = _write_transaction_for(conn)
+    if txn is not None:
+        txn.after_commit.append((callback, args, kwargs))
+        return
+    if getattr(conn, "in_transaction", False):
+        raise RuntimeError(
+            "after-commit callbacks require an outer kanban_db.write_txn context"
+        )
+    callback(*args, **kwargs)
+
+
+def _run_before_commit(
+    conn: sqlite3.Connection, callback: Any, /, *args: Any, **kwargs: Any
+) -> None:
+    """Register a critical finalizer on this tracked outer transaction.
+
+    Unlike after-COMMIT notifications, finalizer errors propagate and prevent
+    COMMIT. This is reserved for staged resources whose durable DB references
+    are valid only after the finalizer succeeds.
+    """
+    txn = _write_transaction_for(conn)
+    if txn is None:
+        raise RuntimeError("before-commit finalizers require kanban_db.write_txn")
+    txn.before_commit.append((callback, args, kwargs))
+
+
+def _run_after_rollback(
+    conn: sqlite3.Connection, callback: Any, /, *args: Any, **kwargs: Any
+) -> None:
+    """Register best-effort cleanup for body, finalizer, or COMMIT failure."""
+    txn = _write_transaction_for(conn)
+    if txn is None:
+        raise RuntimeError("rollback cleanup requires kanban_db.write_txn")
+    txn.after_rollback.append((callback, args, kwargs))
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection):
-    """Context manager for an IMMEDIATE write transaction.
+    """Outermost IMMEDIATE transaction with rollback-safe staged resources.
 
-    Use for any multi-statement write (creating a task + link, claiming a
-    task + recording an event, etc.).  A claim CAS inside this context is
-    atomic -- at most one concurrent writer can succeed.
-
-    The explicit ROLLBACK on exception is wrapped in try/except so that
-    a SQLite auto-rollback (which leaves no active transaction) does not
-    shadow the original exception with a spurious rollback error.
+    Same-connection nested operations join the outer transaction. Critical
+    staged resources finalize before COMMIT and are removed on failure;
+    irreversible callbacks drain once only after the outer COMMIT succeeds.
     """
-    # Domain operations may compose inside one request-level transaction. The
-    # outermost owner owns BEGIN/COMMIT/ROLLBACK; inner operations participate
-    # without a SAVEPOINT, inner commit, or independent rollback. Thus a late
-    # sibling failure can still roll back every earlier field and event.
-    if conn.in_transaction:
+    current = _write_transaction_for(conn)
+    if current is not None:
+        if not conn.in_transaction:
+            raise RuntimeError("kanban transaction context lost its SQLite transaction")
         yield conn
         return
+    if getattr(conn, "in_transaction", False):
+        raise RuntimeError(
+            "untracked SQLite transaction; use kanban_db.write_txn as the outer boundary"
+        )
 
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    txn = _WriteTransactionContext(conn=conn)
+    token = _WRITE_TRANSACTION_CONTEXTS.set(
+        (*_WRITE_TRANSACTION_CONTEXTS.get(), txn)
+    )
+    committed = False
     try:
-        yield conn
-    except Exception:
+        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
         try:
-            conn.execute("ROLLBACK")
-        except sqlite3.OperationalError:
-            # SQLite has already auto-rolled-back the transaction (typical
-            # under EIO, lock contention, or corruption). Nothing to undo;
-            # do not let this secondary failure shadow the real one.
-            pass
-        raise
-    else:
-        try:
-            _execute_boundary_with_retry(conn, "COMMIT")
+            yield conn
         except Exception:
-            # COMMIT exhausted retries with the txn still open; roll back so the
-            # connection isn't poisoned for the next BEGIN IMMEDIATE.
             try:
                 conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
-        # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        else:
+            try:
+                # Finalize while rollback is still possible. Any error must
+                # prevent durable rows from pointing at a missing resource.
+                for callback, args, kwargs in txn.before_commit:
+                    callback(*args, **kwargs)
+                _execute_boundary_with_retry(conn, "COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.OperationalError:
+                    pass
+                raise
+            committed = True
+            _check_file_length_invariant(conn)
+    finally:
+        _WRITE_TRANSACTION_CONTEXTS.reset(token)
+        if not committed:
+            for callback, args, kwargs in reversed(txn.after_rollback):
+                try:
+                    callback(*args, **kwargs)
+                except Exception as exc:
+                    _log.debug("kanban rollback cleanup failed: %s", exc)
+
+    # The context is reset before invoking arbitrary callbacks, preventing a
+    # callback's own DB write from joining a transaction that already ended.
+    for callback, args, kwargs in txn.after_commit:
+        try:
+            callback(*args, **kwargs)
+        except Exception as exc:  # durable DB state cannot now be rolled back
+            _log.debug("kanban after-commit callback failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -3706,6 +3802,8 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if owner_lifecycle_locked(conn, task_id):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -3776,6 +3874,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if owner_lifecycle_locked(conn, task_id):
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3872,7 +3972,7 @@ def claim_task(
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
-    _fire_kanban_lifecycle_hook(
+    run_after_commit(conn, _fire_kanban_lifecycle_hook,
         "kanban_task_claimed",
         task_id,
         board=get_current_board(),
@@ -3905,6 +4005,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if owner_lifecycle_locked(conn, task_id):
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4408,6 +4510,8 @@ def complete_task(
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
     """
+    if owner_lifecycle_locked(conn, task_id):
+        return False
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -4441,6 +4545,8 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        if owner_lifecycle_locked(conn, task_id):
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4480,14 +4586,13 @@ def complete_task(
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
-            for stored_path in metadata.pop("_staged_artifacts", []):
-                path = Path(stored_path)
+            for staged in metadata.pop("_staged_artifacts", []):
                 _insert_completion_attachment(
                     conn,
                     task_id,
-                    filename=path.name,
-                    stored_path=str(path),
-                    size=path.stat().st_size,
+                    filename=staged["filename"],
+                    stored_path=staged["stored_path"],
+                    size=staged["size"],
                     created_at=now,
                 )
         run_id = _end_run(
@@ -4567,9 +4672,9 @@ def complete_task(
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
+    run_after_commit(conn, _cleanup_workspace, conn, task_id)
     _done_task = get_task(conn, task_id)
-    _fire_kanban_lifecycle_hook(
+    run_after_commit(conn, _fire_kanban_lifecycle_hook,
         "kanban_task_completed",
         task_id,
         board=get_current_board(),
@@ -4637,7 +4742,12 @@ def _persist_scratch_completion_artifacts(
     task_id: str,
     metadata: dict,
 ) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
+    """Stage scratch artifacts and finalize them inside the DB transaction.
+
+    Copies remain private temporary files until the outer transaction reaches
+    its before-COMMIT phase. A body, finalization, or COMMIT failure rolls the
+    DB back and removes every temporary or final path owned by this attempt.
+    """
     raw_artifacts = metadata.get("artifacts")
     if not isinstance(raw_artifacts, (list, tuple)):
         return
@@ -4661,19 +4771,56 @@ def _persist_scratch_completion_artifacts(
 
     attachment_dir = task_attachments_dir(task_id, board=board)
     persisted: list[str] = []
+    attachment_rows: list[dict[str, Any]] = []
     used_destinations: set[Path] = set()
+    staged_files: list[dict[str, Any]] = []
     changed = False
 
     def _discard_copies() -> None:
-        for copied in used_destinations:
+        for staged in staged_files:
+            temporary = staged["temporary"]
             try:
-                copied.unlink(missing_ok=True)
+                temporary.unlink(missing_ok=True)
             except OSError:
                 pass
+            # Delete a published final path only while it is still the inode
+            # this transaction created; never unlink a later replacement.
+            identity = staged.get("final_identity")
+            destination = staged["destination"]
+            if identity is not None:
+                try:
+                    stat = destination.stat()
+                    if (stat.st_dev, stat.st_ino) == identity:
+                        destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
         try:
             attachment_dir.rmdir()
         except OSError:
             pass
+
+    def _finalize_copies() -> None:
+        try:
+            for staged in staged_files:
+                temporary = staged["temporary"]
+                destination = staged["destination"]
+                # Same-filesystem hard-link publication is atomic and refuses
+                # to clobber an unexpectedly occupied destination.
+                stat = temporary.stat()
+                identity = (stat.st_dev, stat.st_ino)
+                os.link(temporary, destination)
+                # Record ownership immediately after publish so even a later
+                # staging-unlink failure can remove this exact final inode.
+                staged["final_identity"] = identity
+                temporary.unlink()
+        except Exception as exc:
+            raise ArtifactPreservationError(
+                f"could not finalize declared scratch artifacts: {exc}"
+            ) from exc
+
+    # Register cleanup before staging so every later request failure is covered.
+    _run_after_rollback(conn, _discard_copies)
+    _run_before_commit(conn, _finalize_copies)
 
     for item in raw_artifacts:
         artifact = str(item).strip() if isinstance(item, str) else ""
@@ -4705,11 +4852,15 @@ def _persist_scratch_completion_artifacts(
             )
 
         dest: Optional[Path] = None
+        temporary: Optional[Path] = None
+        copied = 0
         try:
             attachment_dir.mkdir(parents=True, exist_ok=True)
             dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
-            with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
-                copied = 0
+            temporary = attachment_dir / (
+                f".{dest.name}.{secrets.token_hex(12)}.completion-tmp"
+            )
+            with resolved_src.open("rb") as source_file, temporary.open("xb") as destination_file:
                 while chunk := source_file.read(1024 * 1024):
                     copied += len(chunk)
                     if copied > KANBAN_ATTACHMENT_MAX_BYTES:
@@ -4717,10 +4868,12 @@ def _persist_scratch_completion_artifacts(
                             f"declared scratch artifact grew beyond the size limit: {artifact}"
                         )
                     destination_file.write(chunk)
+                destination_file.flush()
+                os.fsync(destination_file.fileno())
         except Exception as exc:
-            if dest is not None:
+            if temporary is not None:
                 try:
-                    dest.unlink(missing_ok=True)
+                    temporary.unlink(missing_ok=True)
                 except OSError:
                     pass
             _discard_copies()
@@ -4731,14 +4884,19 @@ def _persist_scratch_completion_artifacts(
             ) from exc
 
         used_destinations.add(dest)
-        persisted.append(str(dest.resolve()))
+        staged_files.append(
+            {"temporary": temporary, "destination": dest, "final_identity": None}
+        )
+        final_path = str(dest.resolve())
+        persisted.append(final_path)
+        attachment_rows.append(
+            {"filename": dest.name, "stored_path": final_path, "size": copied}
+        )
         changed = True
 
     if changed:
         metadata["artifacts"] = persisted
-        metadata["_staged_artifacts"] = [
-            path for path in persisted if path.startswith(str(attachment_dir.resolve()))
-        ]
+        metadata["_staged_artifacts"] = attachment_rows
 
 
 def _insert_completion_attachment(
@@ -5200,6 +5358,8 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        if owner_lifecycle_locked(conn, task_id):
+            return False
         if cur_row["status"] in OWNER_CONTAINED_STATUSES:
             # Generic block previously enabled the exact bypass chain
             # gate -> blocked -> ready -> claim. Typed gate failure belongs to
@@ -5249,7 +5409,7 @@ def block_task(
             )
             routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
+            run_after_commit(conn, _fire_kanban_lifecycle_hook,
                 "kanban_task_blocked",
                 task_id,
                 board=get_current_board(),
@@ -5367,7 +5527,7 @@ def block_task(
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
-    _fire_kanban_lifecycle_hook(
+    run_after_commit(conn, _fire_kanban_lifecycle_hook,
         "kanban_task_blocked",
         task_id,
         board=get_current_board(),
@@ -5404,6 +5564,9 @@ def promote_task(
     if row is None:
         return False, f"task {task_id} not found"
 
+    if owner_lifecycle_locked(conn, task_id):
+        return False, "owner-audit card requires the dedicated owner lifecycle"
+
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
         return False, (
@@ -5432,6 +5595,8 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        if owner_lifecycle_locked(conn, task_id):
+            return False, "owner-audit card requires the dedicated owner lifecycle"
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -5463,7 +5628,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         # Defense in depth for legacy/external rows: owner audit must not be
         # laundered into dispatchable ready work by generic unblock.
-        if has_owner_audit_history(conn, task_id):
+        if owner_lifecycle_locked(conn, task_id):
             return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
@@ -6452,6 +6617,31 @@ def has_owner_audit_history(conn: sqlite3.Connection, task_id: str) -> bool:
     return row is not None
 
 
+def owner_lifecycle_locked(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Whether generic lifecycle writers must refuse this owner-audit card.
+
+    A successful exact owner execution is the sole event that releases the
+    card into its post-execution workflow. Requests, holds, decisions,
+    rejections, and failed execution outcomes all remain dedicated-route only,
+    regardless of the row's current (possibly legacy-corrupt) status.
+    """
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "AND kind IN (%s) ORDER BY id DESC LIMIT 1"
+        % ",".join("?" * len(OWNER_AUDIT_EVENTS)),
+        (task_id, *OWNER_AUDIT_EVENTS),
+    ).fetchone()
+    if row is None:
+        return False
+    if row["kind"] != OWNER_EXECUTION_EVENT:
+        return True
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return True
+    return payload.get("outcome") != "performed"
+
+
 def _task_status_or_none(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     row = conn.execute(
         "SELECT status FROM tasks WHERE id = ?", (task_id,),
@@ -6655,6 +6845,8 @@ def specify_triage_task(
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        if owner_lifecycle_locked(conn, task_id):
+            return False
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -6809,6 +7001,8 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        if owner_lifecycle_locked(conn, task_id):
+            return None
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
@@ -6941,11 +7135,19 @@ def decompose_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    # Owner-audit cards remain dedicated-route-only until an exact performed
+    # execution releases them into the post-execution workflow.
+    if owner_lifecycle_locked(conn, task_id):
+        return False
     # Fail closed for a card the owner is still being asked about, or one
     # holding an unexecuted approval. See ``owner_archive_locked``.
     if owner_archive_locked(conn, task_id) is not None:
         return False
     with write_txn(conn):
+        if owner_lifecycle_locked(conn, task_id):
+            return False
+        if owner_archive_locked(conn, task_id) is not None:
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7353,6 +7555,8 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        if owner_lifecycle_locked(conn, task_id):
+            return False
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks

@@ -86,6 +86,10 @@
     return body || raw;
   }
 
+  function ownerDecisionFailureAnnouncement(err) {
+    return "대표 승인 결정 실패: " + parseApiErrorMessage(err);
+  }
+
   // Order matches the owner-facing BOARD_COLUMNS in plugin_api.py. The two
   // owner-decision columns are pinned leftmost so the owner finds them in the
   // same place every time, on desktop without horizontal scrolling and on
@@ -781,7 +785,7 @@
     const wsBackoffRef = useRef(1000);
     const wsClosedRef = useRef(false);
 
-    // Keep success announcements bounded: assistive technology gets a stable
+    // Keep success and failure announcements bounded: assistive technology gets a stable
     // status region long enough to announce it, then stale copy is cleared.
     useEffect(function () {
       if (!ownerDecisionAnnouncement) return undefined;
@@ -1050,7 +1054,9 @@
         closeOwnerDecision();
         loadBoard();
       }).catch(function (err) {
-        setError("대표 승인 결정 실패: " + parseApiErrorMessage(err));
+        const failureAnnouncement = ownerDecisionFailureAnnouncement(err);
+        setError(failureAnnouncement);
+        setOwnerDecisionAnnouncement(failureAnnouncement);
         closeOwnerDecision();
         loadBoard();
       });
