@@ -72,6 +72,11 @@ def test_refuses_to_build_without_server_token(monkeypatch):
         action_api.build_asgi_app()
 
 
+def test_refuses_to_build_with_multiple_server_tokens():
+    with pytest.raises(action_api.AuthNotConfigured):
+        action_api.build_asgi_app(tokens=(TOKEN, "second-server-held-token"))
+
+
 def test_exactly_one_public_route_and_no_mutation_methods(live_model):
     app = action_api.build_asgi_app(read_model=live_model, tokens=(TOKEN,))
     routes = [route for route in app.routes if getattr(route, "path", None)]
@@ -86,23 +91,44 @@ def test_exactly_one_public_route_and_no_mutation_methods(live_model):
     assert client.get("/other").status_code == 404
 
 
-def test_correct_bearer_aggregates_six_live_read_model_sections(live_model):
+def test_correct_bearer_returns_exact_owner_contract(live_model):
     response = _client(live_model).get(
         "/executive/status", params={"board_slug": BOARD}, headers=HEADERS
     )
 
     assert response.status_code == 200
     payload = response.json()
-    assert {"board", "tasks", "workers", "usage", "blockers", "owner_gate"} <= payload.keys()
-    assert payload["board"]["board_slug"] == BOARD
-    assert payload["tasks"]["board"] == BOARD
-    assert payload["tasks"]["data_marking"]["content_class"] == "UNTRUSTED_BOARD_DATA"
-    assert payload["workers"]["board"] == BOARD
+    assert set(payload) == {
+        "project",
+        "lane",
+        "task",
+        "worker",
+        "usage",
+        "blocked",
+        "owner_confirm",
+        "freshness",
+        "measured_at",
+    }
+    assert payload["project"]["board_slug"] == BOARD
+    assert payload["lane"]["product_lane"] == "UNAVAILABLE"
+    assert payload["lane"]["product_lanes"] == []
+    assert payload["task"]["board"] == BOARD
+    assert payload["worker"]["board"] == BOARD
     assert payload["usage"]["boards"] == [BOARD]
-    assert payload["blockers"]["items"] == payload["board"]["blockers"]
-    assert payload["owner_gate"]["owner_confirm_status"] == "UNAVAILABLE"
-    assert payload["read_only"] is True
-    assert "strategy" not in payload
+    assert payload["blocked"]["count"] == 1
+    assert payload["owner_confirm"]["owner_confirm_status"] == "UNAVAILABLE"
+    assert payload["measured_at"] == 2_000_000_000
+
+    def nested_keys(value):
+        if isinstance(value, dict):
+            return set(value) | set().union(*(nested_keys(item) for item in value.values()))
+        if isinstance(value, list):
+            return set().union(*(nested_keys(item) for item in value))
+        return set()
+
+    assert nested_keys(payload).isdisjoint(
+        {"internal_paths", "prompts", "sessions", "tokens", "pids", "bodies", "comments"}
+    )
 
 
 def test_wrong_bearer_is_rejected(live_model):
@@ -116,7 +142,7 @@ def test_wrong_bearer_is_rejected(live_model):
 def test_default_board_slug_is_geumhwa(live_model):
     response = _client(live_model).get("/executive/status", headers=HEADERS)
     assert response.status_code == 200
-    assert response.json()["board"]["board_slug"] == BOARD
+    assert response.json()["project"]["board_slug"] == BOARD
 
 
 @pytest.mark.parametrize("slug", ["../secret", "x" * 65, "bad slug"])
@@ -180,13 +206,13 @@ def test_response_is_bounded_and_pagination_is_explicit(live_model):
     payload = response.json()
     assert response.status_code == 200
     assert len(response.content) < 100_000
-    assert payload["tasks"]["limit"] <= 50
-    assert payload["tasks"]["has_more"] is True
-    assert payload["tasks"]["next_cursor"] != "UNAVAILABLE"
-    assert payload["workers"]["limit"] <= 50
-    assert "truncation" in payload["workers"]
-    assert payload["owner_gate"]["limit"] <= 50
-    assert {"truncated", "next_cursor"} <= payload["blockers"].keys()
+    assert payload["task"]["limit"] <= 50
+    assert payload["task"]["has_more"] is True
+    assert payload["task"]["next_cursor"] != "UNAVAILABLE"
+    assert payload["worker"]["limit"] <= 50
+    assert "truncation" in payload["worker"]
+    assert payload["owner_confirm"]["limit"] <= 50
+    assert {"truncated", "next_cursor"} <= payload["blocked"].keys()
 
 
 def test_request_performs_no_snapshot_or_file_write(live_model, tmp_path):
@@ -226,4 +252,11 @@ def test_openapi_declares_only_the_read_action_surface():
     assert auth["type"] == "apiKey"
     assert auth["in"] == "header"
     assert auth["name"] == "Authorization"
+    success = schema["components"]["schemas"]["ExecutiveStatus"]
+    assert success["additionalProperties"] is False
+    assert set(success["required"]) == {
+        "project", "lane", "task", "worker", "usage", "blocked",
+        "owner_confirm", "freshness", "measured_at",
+    }
+    assert set(success["properties"]) == set(success["required"])
     assert "privacy" not in json.dumps(schema).lower()

@@ -47,30 +47,41 @@ components:
   schemas:
     ExecutiveStatus:
       type: object
-      additionalProperties: true
+      additionalProperties: false
       required:
-        - board
-        - tasks
-        - workers
+        - project
+        - lane
+        - task
+        - worker
         - usage
-        - blockers
-        - owner_gate
+        - blocked
+        - owner_confirm
+        - freshness
+        - measured_at
       properties:
-        board:
+        project:
           type: object
           additionalProperties: true
-        tasks:
+        lane:
           type: object
           additionalProperties: true
-        workers:
+        task:
+          type: object
+          additionalProperties: true
+        worker:
           type: object
           additionalProperties: true
         usage:
           type: object
           additionalProperties: true
-        blockers:
+        blocked:
           type: object
           additionalProperties: true
-        owner_gate:
+        owner_confirm:
           type: object
           additionalProperties: true
+        freshness:
+          type: object
+          additionalProperties: true
+        measured_at:
+          type: integer

@@ -22,6 +22,24 @@ _PAGE_LIMITS = (20, 10, 5, 1)
 _BOARD_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _SAFE_ERROR_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
+_TASK_FIELDS = (
+    "public_task_id", "title", "board", "lane", "priority", "workflow_status",
+    "execution_status", "assignment_status", "assignee", "active_worker", "reviewer",
+    "started_at", "last_heartbeat_at", "last_product_output_at", "deadline", "blocked",
+    "blocker_summary", "owner_confirm_status", "next_action", "updated_at",
+    "canonical_receipt", "external_process_detected", "heartbeat_age_seconds",
+    "process_verified", "runtime_deadline_at", "product_maturity",
+    "product_output_count", "source_freshness", "data_quality", "consistency_status",
+    "verification_note",
+)
+_WORKER_FIELDS = (
+    "worker_id", "role", "provider", "model", "board", "lane", "public_task_id",
+    "task_title", "execution_status", "canonical_receipt", "external_process_detected",
+    "process_verified", "started_at", "ended_at", "last_heartbeat_at",
+    "heartbeat_age_seconds", "runtime_deadline_at", "last_product_output_at",
+    "exit_state", "measured_at", "data_quality", "source_freshness",
+)
+
 
 def _error(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(
@@ -43,6 +61,17 @@ def _authenticate_header(value: Optional[str]) -> Optional[str]:
     return token
 
 
+def _select(source: dict, fields: Sequence[str]) -> dict:
+    return {field: source[field] for field in fields if field in source}
+
+
+def _freshness(source: dict) -> dict:
+    return _select(
+        source,
+        ("source_freshness", "data_quality", "consistency_status", "last_activity_at"),
+    )
+
+
 def _aggregate(model: ExecutiveReadModel, board_slug: str, limit: int) -> dict:
     board = dict(model.get_board_summary(board_slug))
     tasks = model.list_tasks(board_slug=board_slug, limit=limit)
@@ -51,7 +80,7 @@ def _aggregate(model: ExecutiveReadModel, board_slug: str, limit: int) -> dict:
     owner_gate = dict(model.get_owner_confirm_queue(board_slug=board_slug, limit=limit))
 
     worker_count = workers.get("count")
-    workers["truncation"] = {
+    worker_truncation = {
         "truncated": "UNVERIFIED" if worker_count == limit else False,
         "next_cursor": "UNAVAILABLE",
         "reason": (
@@ -61,7 +90,7 @@ def _aggregate(model: ExecutiveReadModel, board_slug: str, limit: int) -> dict:
             else "All matching workers fit within the bounded response."
         ),
     }
-    owner_gate["truncation"] = {
+    owner_truncation = {
         "truncated": "UNAVAILABLE",
         "next_cursor": "UNAVAILABLE",
     }
@@ -71,40 +100,60 @@ def _aggregate(model: ExecutiveReadModel, board_slug: str, limit: int) -> dict:
     blocker_truncated = (
         isinstance(blocker_total, int) and blocker_total > len(blocker_items)
     )
-    blockers = {
+    blocked = {
         "items": blocker_items,
         "returned": len(blocker_items),
-        "total": blocker_total,
+        "count": blocker_total,
         "truncated": blocker_truncated,
         "next_cursor": "UNAVAILABLE",
-        "data_marking": board.get("data_marking", "UNAVAILABLE"),
         "data_quality": board.get("data_quality", "UNAVAILABLE"),
     }
-    active_workers = board.get("active_workers", [])
-    active_worker_total = board.get("active_worker_count", "UNAVAILABLE")
-    board["truncation"] = {
-        "blockers": blocker_truncated,
-        "active_workers": (
-            isinstance(active_worker_total, int)
-            and active_worker_total > len(active_workers)
-        ),
-        "next_cursor": "UNAVAILABLE",
-    }
     return {
-        "ok": True,
-        "read_only": True,
-        "board": board,
-        "tasks": tasks,
-        "workers": workers,
-        "usage": usage,
-        "blockers": blockers,
-        "owner_gate": owner_gate,
-        "metadata": {
-            "board_slug": board_slug,
-            "response_limit_bytes": MAX_PUBLIC_RESPONSE_BYTES,
-            "item_limit": limit,
-            "source": "ExecutiveReadModel",
+        "project": _select(board, (
+            "board_id", "board_slug", "board_name", "project_status", "overall_status",
+            "task_count", "active_task_count", "blocked_task_count", "stalled_task_count",
+            "active_worker_count", "workflow_counts", "unmapped_workflow_statuses",
+            "execution_counts", "last_activity_at",
+        )),
+        "lane": {
+            "product_lane": board.get("product_lane", "UNAVAILABLE"),
+            "product_lanes": board.get("product_lanes", []),
+            **_freshness(board),
         },
+        "task": {
+            "board": tasks.get("board", board_slug),
+            "items": [_select(item, _TASK_FIELDS) for item in tasks.get("tasks", [])],
+            **_select(tasks, (
+                "returned", "limit", "next_cursor", "has_more", "scan_truncated",
+                "unsupported_filters",
+            )),
+        },
+        "worker": {
+            "board": workers.get("board", board_slug),
+            "items": [_select(item, _WORKER_FIELDS) for item in workers.get("workers", [])],
+            **_select(workers, ("count", "limit", "unsupported_filters")),
+            "truncation": worker_truncation,
+        },
+        "usage": _select(
+            usage, ("period", "period_seconds", "boards", "usage", "output", "usage_note")
+        ),
+        "blocked": blocked,
+        "owner_confirm": {
+            **_select(owner_gate, (
+                "board", "entries", "count", "limit", "owner_confirm_status",
+                "queue_basis", "required_fields",
+            )),
+            "truncation": owner_truncation,
+        },
+        "freshness": {
+            "project": _freshness(board),
+            "task": _freshness(tasks),
+            "worker": _freshness(workers),
+            "usage": _freshness(usage),
+            "blocked": _freshness(board),
+            "owner_confirm": _freshness(owner_gate),
+        },
+        "measured_at": board["measured_at"],
     }
 
 
@@ -119,8 +168,10 @@ def build_asgi_app(
         if tokens is not None
         else ExecutiveTokenVerifier.from_env()
     )
-    if not verifier.tokens:
-        raise AuthNotConfigured("Executive Action bearer authentication is not configured")
+    if len(verifier.tokens) != 1:
+        raise AuthNotConfigured(
+            "Executive Action bearer authentication requires exactly one server token"
+        )
 
     model = read_model or ExecutiveReadModel()
     app = FastAPI(
