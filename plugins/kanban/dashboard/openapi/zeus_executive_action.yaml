@@ -1,42 +1,101 @@
 openapi: 3.1.0
 info:
-  title: Zeus Executive Status Action
-  version: 0.1.0
-  description: Read-only live operational status from the canonical DAOS Kanban read model.
+  title: Zeus Executive Read Action
+  version: 0.2.0
+  description: Authenticated, bounded, read-only access to canonical DAOS Kanban facts.
 servers:
   - url: https://ax.dominof.com
+security:
+  - BearerAuth: []
 paths:
   /executive/status:
     get:
       operationId: getExecutiveStatus
       summary: Get current executive operational status
-      description: Returns live read-only operational facts. It performs no strategy or mutation.
-      security:
-        - BearerAuth: []
       parameters:
-        - name: board_slug
-          in: query
-          required: false
-          description: Canonical board slug.
-          schema:
-            type: string
-            default: geumhwa-ai-dx
-            minLength: 1
-            maxLength: 64
-            pattern: '^[a-z0-9][a-z0-9_-]{0,63}$'
+        - $ref: '#/components/parameters/BoardSlugDefault'
       responses:
         '200':
           description: Current bounded executive status.
           content:
             application/json:
-              schema:
-                $ref: '#/components/schemas/ExecutiveStatus'
-        '400':
-          description: Invalid or unavailable board read.
-        '401':
-          description: Missing or invalid bearer credential.
-        '503':
-          description: Sanitized temporary read failure.
+              schema: {$ref: '#/components/schemas/ExecutiveStatus'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '405': {$ref: '#/components/responses/MethodNotAllowed'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /executive/boards:
+    get:
+      operationId: listExecutiveBoards
+      summary: List canonical boards
+      parameters:
+        - name: include_archived
+          in: query
+          schema: {type: boolean, default: false}
+      responses:
+        '200':
+          description: Bounded board catalog.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BoardCatalog'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '405': {$ref: '#/components/responses/MethodNotAllowed'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /executive/tasks:
+    get:
+      operationId: listExecutiveTasks
+      summary: List a bounded page of tasks
+      parameters:
+        - $ref: '#/components/parameters/BoardSlugRequired'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Bounded task page.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TaskPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '405': {$ref: '#/components/responses/MethodNotAllowed'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /executive/tasks/{public_task_id}:
+    get:
+      operationId: getExecutiveTask
+      summary: Get bounded task journal detail
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/BoardSlugRequired'
+      responses:
+        '200':
+          description: Bounded sanitized task detail.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TaskDetail'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '405': {$ref: '#/components/responses/MethodNotAllowed'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /executive/tasks/{public_task_id}/comments:
+    get:
+      operationId: listExecutiveTaskComments
+      summary: List a bounded page of sanitized task comments
+      parameters:
+        - $ref: '#/components/parameters/TaskId'
+        - $ref: '#/components/parameters/BoardSlugRequired'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: Bounded comment page.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CommentPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '405': {$ref: '#/components/responses/MethodNotAllowed'}
+        '503': {$ref: '#/components/responses/Unavailable'}
 components:
   securitySchemes:
     BearerAuth:
@@ -44,44 +103,242 @@ components:
       in: header
       name: Authorization
       description: 'Send the server-issued credential as: Bearer <token>'
+  parameters:
+    BoardSlugDefault:
+      name: board_slug
+      in: query
+      schema: {$ref: '#/components/schemas/BoardSlug', default: geumhwa-ai-dx}
+    BoardSlugOptional:
+      name: board_slug
+      in: query
+      schema: {$ref: '#/components/schemas/BoardSlug'}
+    BoardSlugRequired:
+      name: board_slug
+      in: query
+      required: true
+      schema: {$ref: '#/components/schemas/BoardSlug'}
+    TaskId:
+      name: public_task_id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^t_[A-Za-z0-9]{4,40}$'}
+    Limit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 20, default: 10}
+    Cursor:
+      name: cursor
+      in: query
+      schema: {type: string, minLength: 1, maxLength: 200}
+  responses:
+    BadRequest:
+      description: Bounded sanitized invalid-read response.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unauthorized:
+      description: Missing or invalid bearer credential.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unavailable:
+      description: Bounded sanitized temporary failure.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    MethodNotAllowed:
+      description: The route is read-only and does not allow this method.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
   schemas:
+    BoardSlug:
+      type: string
+      minLength: 1
+      maxLength: 64
+      pattern: '^[a-z0-9][a-z0-9_-]{0,63}$'
+    Error:
+      type: object
+      additionalProperties: false
+      required: [ok, error, read_only]
+      properties:
+        ok: {type: boolean, const: false}
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code: {type: string, pattern: '^[A-Z][A-Z0-9_]{0,63}$'}
+            message: {type: string, maxLength: 200}
+        read_only: {type: boolean, const: true}
+    Metadata:
+      type: object
+      additionalProperties: false
+      required: [freshness, coverage, source_gaps, measured_at, snapshot_boundary]
+      properties:
+        freshness: {$ref: '#/components/schemas/Freshness'}
+        coverage: {type: object, additionalProperties: {type: string}}
+        source_gaps: {type: array, maxItems: 64, items: {type: object}}
+        measured_at: {oneOf: [{type: integer}, {type: string}]}
+        snapshot_boundary: {type: object, additionalProperties: {oneOf: [{type: string}, {type: integer}]}}
+    Freshness:
+      type: object
+      additionalProperties: false
+      properties:
+        source_freshness: {type: string}
+        data_quality: {type: string}
+        consistency_status: {type: string}
+        last_activity_at: {oneOf: [{type: integer}, {type: string}]}
+    JournalText:
+      type: object
+      additionalProperties: false
+      required: [text, digest, original_length, original_byte_count, original_character_count, content_class, redacted, redaction_reasons, redaction_count, redaction_counts, truncated]
+      properties:
+        text: {type: string, maxLength: 16000}
+        digest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        original_length: {type: integer, minimum: 0}
+        original_byte_count: {type: integer, minimum: 0}
+        original_character_count: {type: integer, minimum: 0}
+        content_class: {type: string, const: UNTRUSTED_BOARD_DATA}
+        redacted: {type: boolean}
+        redaction_reasons: {type: array, maxItems: 16, items: {type: string}}
+        redaction_count: {type: integer, minimum: 0}
+        redaction_counts: {type: object, additionalProperties: {type: integer, minimum: 1}}
+        truncated: {type: boolean}
     ExecutiveStatus:
       type: object
       additionalProperties: false
-      required:
-        - project
-        - lane
-        - task
-        - worker
-        - usage
-        - blocked
-        - owner_confirm
-        - freshness
-        - measured_at
+      required: [project, lane, task, worker, usage, blocked, owner_confirm, freshness, measured_at]
       properties:
-        project:
-          type: object
-          additionalProperties: true
-        lane:
-          type: object
-          additionalProperties: true
-        task:
-          type: object
-          additionalProperties: true
-        worker:
-          type: object
-          additionalProperties: true
-        usage:
-          type: object
-          additionalProperties: true
-        blocked:
-          type: object
-          additionalProperties: true
-        owner_confirm:
-          type: object
-          additionalProperties: true
-        freshness:
-          type: object
-          additionalProperties: true
-        measured_at:
-          type: integer
+        project: {type: object, additionalProperties: true}
+        lane: {type: object, additionalProperties: true}
+        task: {type: object, additionalProperties: true}
+        worker: {type: object, additionalProperties: true}
+        usage: {type: object, additionalProperties: true}
+        blocked: {type: object, additionalProperties: true}
+        owner_confirm: {type: object, additionalProperties: true}
+        freshness: {type: object, additionalProperties: true}
+        measured_at: {type: integer}
+    BoardCatalog:
+      type: object
+      additionalProperties: false
+      required: [boards, board_count, freshness, coverage, source_gaps, measured_at, snapshot_boundary, read_only]
+      properties:
+        boards: {type: array, maxItems: 1000, items: {type: object}}
+        board_count: {type: integer, minimum: 0}
+        freshness: {$ref: '#/components/schemas/Freshness'}
+        coverage: {type: object, additionalProperties: {type: string}}
+        source_gaps: {type: array, maxItems: 64, items: {type: object}}
+        measured_at: {oneOf: [{type: integer}, {type: string}]}
+        snapshot_boundary: {type: object, additionalProperties: {oneOf: [{type: string}, {type: integer}]}}
+        read_only: {type: boolean, const: true}
+    TaskPage:
+      type: object
+      additionalProperties: false
+      required: [tool, board, tasks, returned, limit, next_cursor, has_more, scan_truncated, unsupported_filters, freshness, coverage, source_gaps, measured_at, snapshot_boundary, degraded_limit, truncated, read_only]
+      properties:
+        tool: {type: string, const: list_tasks}
+        board: {$ref: '#/components/schemas/BoardSlug'}
+        tasks:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              public_task_id: {}
+              title: {}
+              board: {}
+              lane: {}
+              priority: {}
+              workflow_status: {}
+              execution_status: {}
+              assignment_status: {}
+              assignee: {}
+              active_worker: {}
+              reviewer: {}
+              started_at: {}
+              last_heartbeat_at: {}
+              last_product_output_at: {}
+              deadline: {}
+              blocked: {}
+              blocker_summary: {}
+              owner_confirm_status: {}
+              next_action: {}
+              updated_at: {}
+              canonical_receipt: {}
+              external_process_detected: {}
+              heartbeat_age_seconds: {}
+              process_verified: {}
+              runtime_deadline_at: {}
+              product_maturity: {}
+              product_output_count: {}
+              source_freshness: {}
+              data_quality: {}
+              consistency_status: {}
+              verification_note: {}
+        returned: {type: integer, minimum: 0, maximum: 20}
+        limit: {type: integer, minimum: 1, maximum: 20}
+        next_cursor: {type: string, maxLength: 200}
+        has_more: {type: boolean}
+        scan_truncated: {type: boolean}
+        unsupported_filters: {type: object, additionalProperties: {type: string}}
+        freshness: {$ref: '#/components/schemas/Freshness'}
+        coverage: {type: object, additionalProperties: {type: string}}
+        source_gaps: {type: array, maxItems: 64, items: {type: object}}
+        measured_at: {oneOf: [{type: integer}, {type: string}]}
+        snapshot_boundary: {type: object, additionalProperties: {oneOf: [{type: string}, {type: integer}]}}
+        degraded_limit: {type: integer, minimum: 1, maximum: 20}
+        truncated: {type: boolean}
+        read_only: {type: boolean, const: true}
+    TaskDetail:
+      type: object
+      additionalProperties: false
+      required: [public_task_id, board_slug, title, workflow_status, assignment_status, assignee, created_at, updated_at, body, freshness, coverage, source_gaps, measured_at, snapshot_boundary, read_only]
+      properties:
+        public_task_id: {type: string}
+        board_slug: {$ref: '#/components/schemas/BoardSlug'}
+        title: {type: string, maxLength: 160}
+        workflow_status: {type: string}
+        assignment_status: {type: string}
+        assignee: {type: string}
+        created_at: {type: integer}
+        updated_at: {oneOf: [{type: integer}, {type: string}]}
+        body: {$ref: '#/components/schemas/JournalText'}
+        freshness: {$ref: '#/components/schemas/Freshness'}
+        coverage: {type: object, additionalProperties: {type: string}}
+        source_gaps: {type: array, maxItems: 64, items: {type: object}}
+        measured_at: {oneOf: [{type: integer}, {type: string}]}
+        snapshot_boundary: {type: object, additionalProperties: {oneOf: [{type: string}, {type: integer}]}}
+        read_only: {type: boolean, const: true}
+    CommentPage:
+      type: object
+      additionalProperties: false
+      required: [public_task_id, board_slug, comments, returned, limit, next_cursor, has_more, freshness, coverage, source_gaps, measured_at, snapshot_boundary, degraded_limit, truncated, read_only]
+      properties:
+        public_task_id: {type: string}
+        board_slug: {$ref: '#/components/schemas/BoardSlug'}
+        comments:
+          type: array
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: false
+            required: [public_handle, author_role, created_at, body]
+            properties:
+              public_handle: {type: string}
+              author_role: {type: string, enum: [REVIEWER, HUMAN, AGENT]}
+              created_at: {type: integer}
+              body: {$ref: '#/components/schemas/JournalText'}
+        returned: {type: integer, minimum: 0, maximum: 20}
+        limit: {type: integer, minimum: 1, maximum: 20}
+        next_cursor: {type: string, maxLength: 200}
+        has_more: {type: boolean}
+        freshness: {$ref: '#/components/schemas/Freshness'}
+        coverage: {type: object, additionalProperties: {type: string}}
+        source_gaps: {type: array, maxItems: 64, items: {type: object}}
+        measured_at: {oneOf: [{type: integer}, {type: string}]}
+        snapshot_boundary: {type: object, additionalProperties: {oneOf: [{type: string}, {type: integer}]}}
+        degraded_limit: {type: integer, minimum: 1, maximum: 20}
+        truncated: {type: boolean}
+        read_only: {type: boolean, const: true}

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from jsonschema import Draft202012Validator, RefResolver
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
@@ -77,18 +78,72 @@ def test_refuses_to_build_with_multiple_server_tokens():
         action_api.build_asgi_app(tokens=(TOKEN, "second-server-held-token"))
 
 
-def test_exactly_one_public_route_and_no_mutation_methods(live_model):
+def test_exact_get_only_public_routes_and_no_mutation_methods(live_model):
     app = action_api.build_asgi_app(read_model=live_model, tokens=(TOKEN,))
     routes = [route for route in app.routes if getattr(route, "path", None)]
-    assert [(route.path, route.methods) for route in routes] == [
-        ("/executive/status", {"GET"})
-    ]
+    assert {(route.path, frozenset(route.methods)) for route in routes} == {
+        ("/executive/status", frozenset({"GET"})),
+        ("/executive/boards", frozenset({"GET"})),
+        ("/executive/tasks", frozenset({"GET"})),
+        ("/executive/tasks/{public_task_id}", frozenset({"GET"})),
+        ("/executive/tasks/{public_task_id}/comments", frozenset({"GET"})),
+    }
 
     client = TestClient(app)
-    for method in ("post", "put", "patch", "delete"):
-        assert getattr(client, method)("/executive/status", headers=HEADERS).status_code == 405
+    for path in (
+        "/executive/status", "/executive/boards", "/executive/tasks",
+        "/executive/tasks/t_abcd", "/executive/tasks/t_abcd/comments",
+    ):
+        for method in ("post", "put", "patch", "delete", "options"):
+            response = getattr(client, method)(path, headers=HEADERS)
+            assert response.status_code == 405
+            assert response.json() == {
+                "ok": False,
+                "error": {"code": "METHOD_NOT_ALLOWED", "message": "Method is not allowed"},
+                "read_only": True,
+            }
     assert client.get("/executive/status/").status_code == 404
     assert client.get("/other").status_code == 404
+
+
+def test_new_reads_are_authenticated_bounded_and_metadata_complete(live_model):
+    client = _client(live_model)
+    assert client.get("/executive/boards").status_code == 401
+
+    boards = client.get("/executive/boards", headers=HEADERS)
+    tasks = client.get(
+        "/executive/tasks", params={"board_slug": BOARD}, headers=HEADERS,
+    )
+    task_id = tasks.json()["tasks"][0]["public_task_id"]
+    detail = client.get(
+        f"/executive/tasks/{task_id}", params={"board_slug": BOARD}, headers=HEADERS,
+    )
+    comments = client.get(
+        f"/executive/tasks/{task_id}/comments",
+        params={"board_slug": BOARD}, headers=HEADERS,
+    )
+
+    for response in (boards, tasks, detail, comments):
+        assert response.status_code == 200
+        assert len(response.content) <= 100_000
+        assert {"freshness", "coverage", "source_gaps", "measured_at", "snapshot_boundary"} <= response.json().keys()
+    assert tasks.json()["limit"] == 10
+    assert comments.json()["limit"] == 10
+    assert client.get(
+        "/executive/tasks", params={"board_slug": BOARD, "limit": 21}, headers=HEADERS,
+    ).status_code == 400
+
+
+@pytest.mark.parametrize("path", [
+    "/executive/tasks",
+    "/executive/tasks/t_abcd",
+    "/executive/tasks/t_abcd/comments",
+])
+def test_new_task_routes_require_board_slug(live_model, path):
+    response = _client(live_model).get(path, headers=HEADERS)
+    assert response.status_code == 400
+    assert len(response.content) < 1000
+    assert response.json()["error"]["code"] == "INVALID_BOARD"
 
 
 def test_correct_bearer_returns_exact_owner_contract(live_model):
@@ -243,11 +298,21 @@ def test_openapi_declares_only_the_read_action_surface():
 
     assert schema["openapi"] == "3.1.0"
     assert schema["servers"] == [{"url": "https://ax.dominof.com"}]
-    assert set(schema["paths"]) == {"/executive/status"}
-    operation = schema["paths"]["/executive/status"]
-    assert set(operation) == {"get"}
-    assert operation["get"]["operationId"] == "getExecutiveStatus"
-    assert operation["get"]["security"] == [{"BearerAuth": []}]
+    assert set(schema["paths"]) == {
+        "/executive/status",
+        "/executive/boards",
+        "/executive/tasks",
+        "/executive/tasks/{public_task_id}",
+        "/executive/tasks/{public_task_id}/comments",
+    }
+    assert all(set(path_item) == {"get"} for path_item in schema["paths"].values())
+    assert schema["security"] == [{"BearerAuth": []}]
+    assert {
+        path_item["get"]["operationId"] for path_item in schema["paths"].values()
+    } == {
+        "getExecutiveStatus", "listExecutiveBoards", "listExecutiveTasks",
+        "getExecutiveTask", "listExecutiveTaskComments",
+    }
     auth = schema["components"]["securitySchemes"]["BearerAuth"]
     assert auth["type"] == "apiKey"
     assert auth["in"] == "header"
@@ -259,4 +324,103 @@ def test_openapi_declares_only_the_read_action_surface():
         "owner_confirm", "freshness", "measured_at",
     }
     assert set(success["properties"]) == set(success["required"])
+    journal = schema["components"]["schemas"]["JournalText"]
+    assert journal["additionalProperties"] is False
+    assert journal["properties"]["text"]["maxLength"] == 16_000
+    assert schema["components"]["parameters"]["Limit"]["schema"] == {
+        "type": "integer", "minimum": 1, "maximum": 20, "default": 10,
+    }
     assert "privacy" not in json.dumps(schema).lower()
+
+
+def test_every_endpoint_200_body_validates_against_openapi(live_model):
+    schema_path = Path(__file__).parents[2] / "plugins/kanban/dashboard/openapi/zeus_executive_action.yaml"
+    document = yaml.safe_load(schema_path.read_text(encoding="utf-8"))
+    resolver = RefResolver.from_schema(document)
+    client = _client(live_model)
+    tasks = client.get("/executive/tasks", params={"board_slug": BOARD}, headers=HEADERS)
+    task_id = tasks.json()["tasks"][0]["public_task_id"]
+    calls = {
+        "/executive/status": client.get("/executive/status", params={"board_slug": BOARD}, headers=HEADERS),
+        "/executive/boards": client.get("/executive/boards", headers=HEADERS),
+        "/executive/tasks": tasks,
+        "/executive/tasks/{public_task_id}": client.get(f"/executive/tasks/{task_id}", params={"board_slug": BOARD}, headers=HEADERS),
+        "/executive/tasks/{public_task_id}/comments": client.get(f"/executive/tasks/{task_id}/comments", params={"board_slug": BOARD}, headers=HEADERS),
+    }
+    for path, response in calls.items():
+        assert response.status_code == 200
+        response_schema = document["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        Draft202012Validator(response_schema, resolver=resolver).validate(response.json())
+
+
+def test_task_page_projection_exactly_matches_declared_fields(live_model):
+    document = yaml.safe_load((Path(__file__).parents[2] / "plugins/kanban/dashboard/openapi/zeus_executive_action.yaml").read_text(encoding="utf-8"))
+    declared = set(document["components"]["schemas"]["TaskPage"]["properties"]["tasks"]["items"]["properties"])
+    payload = _client(live_model).get(
+        "/executive/tasks", params={"board_slug": BOARD}, headers=HEADERS,
+    ).json()
+    assert payload["tasks"]
+    assert set(payload["tasks"][0]) == declared
+
+
+def test_task_cursor_pages_including_final_page_never_claim_complete(live_model):
+    conn = kb.connect(board=BOARD)
+    try:
+        kb.create_task(conn, title="Second card", assignee="athena", board=BOARD)
+    finally:
+        conn.close()
+    client = _client(live_model)
+    first = client.get(
+        "/executive/tasks", params={"board_slug": BOARD, "limit": 1}, headers=HEADERS,
+    ).json()
+    assert first["has_more"] is True
+    assert first["coverage"]["tasks"] == "PAGED"
+    final = client.get(
+        "/executive/tasks",
+        params={"board_slug": BOARD, "limit": 1, "cursor": first["next_cursor"]},
+        headers=HEADERS,
+    ).json()
+    assert final["has_more"] is False
+    assert final["coverage"]["tasks"] == "PAGED"
+
+
+def test_hangul_heavy_comments_degrade_and_all_rows_are_cursor_reachable(live_model):
+    task_id = _client(live_model).get(
+        "/executive/tasks", params={"board_slug": BOARD}, headers=HEADERS,
+    ).json()["tasks"][0]["public_task_id"]
+    conn = kb.connect(board=BOARD)
+    try:
+        for index in range(17):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?,?,?,?)",
+                (task_id, f"agent-{index}", f"row-{index}:" + "한" * 16_000, 10_000 + index),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    client = _client(live_model)
+    cursor = None
+    seen = set()
+    pages = 0
+    while True:
+        params = {"board_slug": BOARD, "limit": 20}
+        if cursor:
+            params["cursor"] = cursor
+        response = client.get(f"/executive/tasks/{task_id}/comments", params=params, headers=HEADERS)
+        assert response.status_code == 200
+        assert len(response.content) <= 100_000
+        payload = response.json()
+        if payload["degraded_limit"] < 20:
+            assert payload["truncated"] is True
+        else:
+            assert payload["has_more"] is False
+            assert payload["truncated"] is False
+        seen.update(comment["created_at"] for comment in payload["comments"])
+        pages += 1
+        if not payload["has_more"]:
+            assert payload["coverage"]["comments"] == ("COMPLETE" if pages == 1 else "PAGED")
+            break
+        assert payload["next_cursor"] != "UNAVAILABLE"
+        cursor = payload["next_cursor"]
+    assert seen == {10_000 + index for index in range(17)}

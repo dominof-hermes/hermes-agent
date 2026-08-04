@@ -46,6 +46,7 @@ import binascii
 import contextlib
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -54,7 +55,10 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional, Protocol, Sequence, Union
+from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Sequence, Union
+
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from hermes_cli import kanban_db as kb
 
@@ -369,6 +373,28 @@ _SAFE_REF = re.compile(r"^[^\W_][\w.\-/]{0,63}$", re.UNICODE)
 #: The public card id is the same stable ``t_*`` id the Dashboard shows — the
 #: owner refers to cards by it, so parity requires passing it through unchanged.
 _PUBLIC_TASK_ID = re.compile(r"^t_[A-Za-z0-9]{4,40}$")
+_CURSOR_STATE_ID = re.compile(r"^(?:t_[A-Za-z0-9]{4,40}|c_[0-9]+)$")
+
+_JOURNAL_REDACTIONS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("CONNECTION_STRING", re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://\S+")),
+    ("PRIVATE_KEY", re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)",
+        re.DOTALL,
+    )),
+    ("CREDENTIAL", re.compile(
+        r"[A-Za-z0-9_.\-]{0,64}(?:api[_\-]?key|secret|token|password|passwd|credential|bearer|"
+        r"authorization)[A-Za-z0-9_.\-]{0,64}\s*[:=]\s*\S+", re.IGNORECASE,
+    )),
+    ("CREDENTIAL", re.compile(r"\b(?:AKIA|ASIA|ghp_|gho_|sk-|xox[baprs]-)[A-Za-z0-9/+_\-]{8,}\b")),
+    ("HIGH_RISK_PII", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
+    ("HIGH_RISK_PII", re.compile(r"\b(?:\d[ -]*?){13,19}\b")),
+    ("UNSAFE_ABSOLUTE_PATH", re.compile(r"\b[A-Za-z]:\\[^\s\"']*|(?<![\w.])/(?:[\w.@+\-]+/)*[\w.@+\-]+")),
+    ("PROMPT_LIKE_TEXT", re.compile(
+        r"(?i)\b(?:ignore|disregard|forget)\s+(?:all\s+|any\s+)?(?:previous|prior|above|earlier)\s+"
+        r"(?:instructions?|prompts?|rules?)|\b(?:system|developer)\s+prompt\b|\byou\s+are\s+now\b|"
+        r"\bnew\s+instructions?\s*:|<\|[^|]*\|>",
+    )),
+)
 
 
 def sanitize_text(value: Any, *, max_len: int = 200) -> str:
@@ -417,6 +443,45 @@ def sanitize_reference(value: Any) -> str:
         if pattern.search(candidate):
             return REDACTED
     return candidate
+
+
+def sanitize_journal_text(value: Any, *, max_len: int) -> dict:
+    """Sanitize untrusted journal text and return explicit transformation metadata."""
+    raw = value if isinstance(value, str) else ""
+    original = raw.encode("utf-8", errors="replace")
+    text = _CONTROL_CHARS.sub(" ", raw)
+    reasons: list[str] = []
+    redaction_counts: dict[str, int] = {}
+    for reason, pattern in _JOURNAL_REDACTIONS:
+        text, count = pattern.subn(REDACTED, text)
+        if count:
+            redaction_counts[reason] = redaction_counts.get(reason, 0) + count
+        if count and reason not in reasons:
+            reasons.append(reason)
+    text = _REDACTED_RUN.sub(REDACTED, text)
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    encoded_text = text.encode("utf-8")
+    truncated = len(text) > max_len or len(encoded_text) > max_len
+    if truncated:
+        suffix = "…"
+        suffix_bytes = suffix.encode("utf-8")
+        byte_budget = max(0, max_len - len(suffix_bytes))
+        candidate = encoded_text[:byte_budget].decode("utf-8", errors="ignore").rstrip()
+        text = candidate + suffix
+    return {
+        "text": text,
+        "digest": hashlib.sha256(original).hexdigest(),
+        # Compatibility alias: this has always counted encoded UTF-8 bytes.
+        "original_length": len(original),
+        "original_byte_count": len(original),
+        "original_character_count": len(raw),
+        "content_class": "UNTRUSTED_BOARD_DATA",
+        "redacted": bool(reasons),
+        "redaction_reasons": reasons,
+        "redaction_count": sum(redaction_counts.values()),
+        "redaction_counts": redaction_counts,
+        "truncated": truncated,
+    }
 
 
 def validate_public_task_id(value: Any) -> str:
@@ -702,6 +767,9 @@ _DEFAULT_LIMIT = 20
 _SCAN_CAP = 500
 _TITLE_MAX = 160
 _CURSOR_MAX_LEN = 200
+_CURSOR_VERSION = "c1"
+_CURSOR_NONCE_BYTES = 12
+_CURSOR_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class ExecutiveReadModel:
@@ -714,6 +782,8 @@ class ExecutiveReadModel:
         clock: Callable[[], float] = time.time,
         pid_probe: Callable[[int], Optional[bool]] = default_pid_probe,
         identity_salt: Optional[bytes] = None,
+        cursor_keys: Optional[Mapping[str, bytes]] = None,
+        cursor_active_key_id: Optional[str] = None,
         usage_collector: Optional[Callable[[], dict]] = None,
         process_source: Optional[ProcessSource] = None,
     ):
@@ -726,6 +796,9 @@ class ExecutiveReadModel:
         salt, stability = _resolve_salt(identity_salt)
         self._salt = salt
         self.identifier_stability = stability
+        self._cursor_keys, self._cursor_active_key_id = _resolve_cursor_keys(
+            cursor_keys, cursor_active_key_id, salt,
+        )
 
     # -- infrastructure ----------------------------------------------------
 
@@ -838,36 +911,53 @@ class ExecutiveReadModel:
         ).decode("ascii").rstrip("=")
 
     def _encode_cursor(self, created_at: int, task_id: str, context: str) -> str:
-        """Opaque, server-signed cursor bound to its filter context."""
-        raw = f"{int(created_at)}|{task_id}|{context}".encode("utf-8")
-        body = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-        return f"{body}.{self._sign(raw)}"
+        """Return a confidential, authenticated cursor bound to its context."""
+        plaintext = json.dumps(
+            [int(created_at), task_id, context], separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")
+        key_id = self._cursor_active_key_id
+        nonce = secrets.token_bytes(_CURSOR_NONCE_BYTES)
+        aad = f"{_CURSOR_VERSION}.{key_id}".encode("ascii")
+        ciphertext = AESGCM(self._cursor_keys[key_id]).encrypt(nonce, plaintext, aad)
+        token = ".".join((
+            _CURSOR_VERSION, key_id, _b64url_encode(nonce), _b64url_encode(ciphertext),
+        ))
+        if len(token) > _CURSOR_MAX_LEN:
+            raise SafeReadError("INVALID_CURSOR", "cursor could not be issued")
+        return token
 
     def _decode_cursor(self, cursor: Optional[str], context: str):
         if cursor is None or cursor == "" or cursor == UNAVAILABLE:
             return None
         if not isinstance(cursor, str) or len(cursor) > _CURSOR_MAX_LEN:
             raise SafeReadError("INVALID_CURSOR", "cursor is malformed")
-        body, _, signature = cursor.partition(".")
-        if not body or not signature:
-            raise SafeReadError("INVALID_CURSOR", "cursor is malformed")
-        padded = body + "=" * (-len(body) % 4)
         try:
-            raw = base64.urlsafe_b64decode(padded.encode("ascii"))
-        except (binascii.Error, ValueError):
-            raise SafeReadError("INVALID_CURSOR", "cursor is malformed")
-        if not hmac.compare_digest(signature, self._sign(raw)):
-            raise SafeReadError("INVALID_CURSOR", "cursor signature is invalid")
-        try:
-            created_at, task_id, cursor_context = raw.decode("utf-8").split("|", 2)
-        except (UnicodeDecodeError, ValueError):
-            raise SafeReadError("INVALID_CURSOR", "cursor is malformed")
+            version, key_id, nonce_text, ciphertext_text = cursor.split(".")
+            if version != _CURSOR_VERSION or key_id not in self._cursor_keys:
+                raise ValueError
+            nonce = _b64url_decode(nonce_text)
+            ciphertext = _b64url_decode(ciphertext_text)
+            if len(nonce) != _CURSOR_NONCE_BYTES or len(ciphertext) < 16:
+                raise ValueError
+            raw = AESGCM(self._cursor_keys[key_id]).decrypt(
+                nonce, ciphertext, f"{version}.{key_id}".encode("ascii"),
+            )
+            payload = json.loads(raw)
+            if not isinstance(payload, list) or len(payload) != 3:
+                raise ValueError
+            created_at, task_id, cursor_context = payload
+        except (InvalidTag, ValueError, TypeError, json.JSONDecodeError, binascii.Error):
+            raise SafeReadError("INVALID_CURSOR", "cursor is invalid")
         if cursor_context != context:
             raise SafeReadError(
                 "INVALID_CURSOR", "cursor does not belong to this filter context")
         try:
-            return int(created_at), validate_public_task_id(task_id)
-        except (ValueError, SafeReadError):
+            if isinstance(created_at, bool) or not isinstance(created_at, int):
+                raise ValueError
+            if not isinstance(task_id, str) or not _CURSOR_STATE_ID.fullmatch(task_id):
+                raise ValueError
+            return created_at, task_id
+        except (ValueError, TypeError, SafeReadError):
             raise SafeReadError("INVALID_CURSOR", "cursor is malformed")
 
     def _filter_context(self, **filters: Any) -> str:
@@ -1437,7 +1527,7 @@ class ExecutiveReadModel:
 
         context = self._filter_context(
             board=slug, lane=lane, workflow=workflow_filter, execution=execution_filter,
-            assignee=assignee, owner_confirm=owner_confirm_filter, since=since, limit=limit,
+            assignee=assignee, owner_confirm=owner_confirm_filter, since=since,
         )
         after = self._decode_cursor(cursor, context)
 
@@ -1641,6 +1731,131 @@ class ExecutiveReadModel:
                 boards=matches,
             )
         return matches[0]
+
+    # -- bounded executive journal reads ---------------------------------
+
+    def get_task_journal(
+        self, public_task_id: str, board_slug: Optional[str] = None,
+    ) -> dict:
+        """Return one card with a bounded sanitized body; never execute its text."""
+        task_id = validate_public_task_id(public_task_id)
+        slug = self._locate_task(task_id, board_slug)
+        with self._board_conn(slug) as conn:
+            task = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if task is None:
+                raise SafeReadError("UNKNOWN_TASK", "task not found on this board")
+            activity = self._activity_by_task(conn, [task_id]).get(task_id)
+            runs = self._runs_by_task(conn, [task_id]).get(task_id, [])
+        updated_at = _max_int(activity, task["created_at"], task["started_at"],
+                              task["completed_at"], task["last_heartbeat_at"])
+        record = self._task_record(task, runs, slug, updated_at)
+        envelope = self._envelope(
+            last_activity_at=updated_at,
+            data_quality=record["data_quality"],
+            consistency=record["consistency_status"],
+            gaps=self._standing_gaps("product_maturity", "deadline", "next_action", "reviewer"),
+        )
+        return {
+            "public_task_id": task_id,
+            "board_slug": slug,
+            "title": record["title"],
+            "workflow_status": record["workflow_status"],
+            "assignment_status": record["assignment_status"],
+            "assignee": record["assignee"],
+            "created_at": int(task["created_at"]),
+            "updated_at": _ts(updated_at),
+            "body": sanitize_journal_text(task["body"], max_len=16_000),
+            "freshness": {
+                "source_freshness": envelope["source_freshness"],
+                "last_activity_at": _ts(updated_at),
+            },
+            "coverage": {"task": "COMPLETE", "body": "BOUNDED_SANITIZED"},
+            "source_gaps": envelope["source_gaps"],
+            "measured_at": envelope["measured_at"],
+            "snapshot_boundary": {
+                "kind": "TASK_ACTIVITY_AT_READ",
+                "updated_at": _ts(updated_at),
+            },
+            "read_only": True,
+        }
+
+    def list_task_comments(
+        self,
+        public_task_id: str,
+        board_slug: Optional[str] = None,
+        *,
+        limit: int = 10,
+        cursor: Optional[str] = None,
+    ) -> dict:
+        """Return a deterministic keyset page of bounded sanitized comments."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
+            raise SafeReadError("INVALID_LIMIT", "limit must be between 1 and 20")
+        task_id = validate_public_task_id(public_task_id)
+        slug = self._locate_task(task_id, board_slug)
+        context = self._filter_context(route="task_comments", board=slug, task=task_id)
+        after = self._decode_cursor(cursor, context)
+        with self._board_conn(slug) as conn:
+            sql = ["SELECT id, author, body, created_at FROM task_comments WHERE task_id = ?"]
+            params: list[Any] = [task_id]
+            if after is not None:
+                try:
+                    comment_id = int(after[1][2:])
+                except (TypeError, ValueError):
+                    raise SafeReadError("INVALID_CURSOR", "cursor is invalid")
+                sql.append("AND (created_at < ? OR (created_at = ? AND id < ?))")
+                params.extend((after[0], after[0], comment_id))
+            sql.append("ORDER BY created_at DESC, id DESC LIMIT ?")
+            params.append(limit + 1)
+            rows = conn.execute(" ".join(sql), params).fetchall()
+        page = rows[:limit]
+        has_more = len(rows) > limit
+        comments = []
+        for row in page:
+            author = str(row["author"])
+            lowered = author.casefold()
+            role = "REVIEWER" if "review" in lowered else (
+                "HUMAN" if lowered in {"owner", "user", "human"} else "AGENT"
+            )
+            comments.append({
+                "public_handle": self._public_id("actor", author),
+                "author_role": role,
+                "created_at": int(row["created_at"]),
+                "body": sanitize_journal_text(row["body"], max_len=16_000),
+            })
+        next_cursor = UNAVAILABLE
+        if has_more and page:
+            last = page[-1]
+            next_cursor = self._encode_cursor(
+                int(last["created_at"]), f"c_{int(last['id'])}", context,
+            )
+        newest = max((int(row["created_at"]) for row in page), default=None)
+        envelope = self._envelope(
+            last_activity_at=newest, data_quality="MEASURED",
+            gaps=self._standing_gaps(),
+        )
+        return {
+            "public_task_id": task_id,
+            "board_slug": slug,
+            "comments": comments,
+            "returned": len(comments),
+            "limit": limit,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "freshness": {
+                "source_freshness": envelope["source_freshness"],
+                "last_activity_at": _ts(newest),
+            },
+            "coverage": {
+                "comments": "COMPLETE" if cursor is None and not has_more else "PAGED"
+            },
+            "source_gaps": envelope["source_gaps"],
+            "measured_at": envelope["measured_at"],
+            "snapshot_boundary": {
+                "kind": "COMMENT_KEYSET_AT_READ",
+                "newest_created_at": _ts(newest),
+            },
+            "read_only": True,
+        }
 
     # -- tool 6: get_worker_status ----------------------------------------
 
@@ -1940,6 +2155,45 @@ def _resolve_salt(explicit: Optional[bytes]) -> tuple[bytes, str]:
     # and cursor signatures still never leave the process. Identifiers are then
     # stable only for this process's lifetime, which the envelope declares.
     return secrets.token_bytes(32), "PROCESS_LOCAL"
+
+
+def _b64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    if not isinstance(value, str) or not _CURSOR_SEGMENT_RE.fullmatch(value):
+        raise ValueError("invalid base64url segment")
+    return base64.b64decode(
+        value + "=" * (-len(value) % 4), altchars=b"-_", validate=True,
+    )
+
+
+def _resolve_cursor_keys(
+    explicit: Optional[Mapping[str, bytes]], active_key_id: Optional[str], salt: bytes,
+) -> tuple[dict[str, bytes], str]:
+    """Resolve a small AES-256 keyring without exposing key material."""
+    if explicit is None:
+        raw = os.environ.get("DAOS_EXECUTIVE_MCP_CURSOR_KEY", "").strip()
+        if raw:
+            try:
+                keys = {"configured": _b64url_decode(raw)}
+            except (ValueError, binascii.Error):
+                raise ValueError("cursor key configuration is invalid")
+        else:
+            keys = {"derived": hashlib.sha256(b"executive-cursor\0" + salt).digest()}
+    else:
+        keys = dict(explicit)
+    if not keys or len(keys) > 4:
+        raise ValueError("cursor keyring is invalid")
+    for key_id, key in keys.items():
+        if (not isinstance(key_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", key_id)
+                or not isinstance(key, bytes) or len(key) != 32):
+            raise ValueError("cursor keyring is invalid")
+    selected = active_key_id or next(iter(keys))
+    if selected not in keys:
+        raise ValueError("cursor keyring is invalid")
+    return keys, selected
 
 
 def _chunks(items: list, size: int):
