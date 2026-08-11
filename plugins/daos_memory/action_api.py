@@ -81,7 +81,10 @@ class WriteBody(ContextBody):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def effective_window_is_ordered(self):
+    def temporal_contract_is_valid(self):
+        if self.event_type.upper() == "HISTORY_IMPORT":
+            if self.occurred_at is None or self.source_session_at is None:
+                raise ValueError("HISTORY_IMPORT requires occurred_at and source_session_at")
         if self.effective_to is not None:
             start = self.effective_from or self.occurred_at
             if start is None:

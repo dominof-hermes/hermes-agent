@@ -425,6 +425,27 @@ def test_historical_import_cannot_use_supersede_to_replace_current(client, store
     assert store.relations == []
 
 
+def test_history_import_intent_requires_original_session_times_and_never_becomes_current(client, store):
+    token, _ = access(client, product="DAOS", topic="memory")
+    headers = {"Authorization": f"Bearer {token}"}
+    old = next(item for item in store.events if item["title"] == "Zeus current note")
+    before = deepcopy(store.events)
+    payload = {
+        "product": "DAOS", "topic": "memory", "memory_type": "SESSION_SUMMARY",
+        "event_type": "HISTORY_IMPORT", "title": "Undated prior session",
+        "summary": "historical intent without source time", "content": "must fail closed",
+        "source_interface": "chatgpt", "authority_level": "AGENT_ASSESSMENT", "metadata": {},
+    }
+
+    write = client.post("/v1/events", headers=headers, json=payload)
+    supersede = client.post(f"/v1/events/{old['id']}/supersede", headers=headers, json=payload)
+
+    assert write.status_code == 422
+    assert supersede.status_code == 422
+    assert store.events == before
+    assert store.relations == []
+
+
 def test_event_metadata_over_json_byte_cap_is_rejected(client):
     token, _ = access(client)
     response = client.post(

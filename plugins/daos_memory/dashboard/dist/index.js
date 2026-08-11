@@ -15,6 +15,48 @@
     return h("div", { className: "dm-error", role: "alert" }, props.message || "Memory service unavailable");
   }
 
+  function createLatestRequestChannel() {
+    let generation = 0;
+    let controller = null;
+    return {
+      start: function () {
+        if (controller) controller.abort();
+        generation += 1;
+        controller = new AbortController();
+        return { generation: generation, signal: controller.signal };
+      },
+      isCurrent: function (candidate) { return candidate === generation; },
+      finish: function (candidate) { if (candidate === generation) controller = null; },
+      invalidate: function () {
+        generation += 1;
+        if (controller) controller.abort();
+        controller = null;
+      }
+    };
+  }
+
+  function handleDialogKey(event, focusableElements, onClose) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onClose();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    if (!focusableElements.length) {
+      event.preventDefault();
+      return;
+    }
+    const first = focusableElements[0];
+    const last = focusableElements[focusableElements.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   function EventTable(props) {
     const items = props.items || [];
     const onSelect = props.onSelect;
@@ -25,7 +67,7 @@
         h("th", null, "Status"), h("th", null, "Effective / Occurred"), h("th", null, "Actor")
       )),
       h("tbody", null, items.map(function (item) {
-        function openDetail() { onSelect(item); }
+        function openDetail(event) { onSelect(item, event.currentTarget); }
         return h("tr", {
           key: item.id,
           className: "dm-event-row",
@@ -36,7 +78,7 @@
           onKeyDown: function (event) {
             if (event.key === "Enter" || event.key === " ") {
               event.preventDefault();
-              openDetail();
+              openDetail(event);
             }
           }
         },
@@ -57,14 +99,24 @@
   function EventDetail(props) {
     const item = props.item;
     const onClose = props.onClose;
+    const returnFocus = props.returnFocus;
     const closeRef = React.useRef(null);
+    const dialogRef = React.useRef(null);
 
     React.useEffect(function () {
-      function handleKey(event) { if (event.key === "Escape") onClose(); }
+      function handleKey(event) {
+        const focusable = dialogRef.current ? Array.prototype.slice.call(dialogRef.current.querySelectorAll(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )) : [];
+        handleDialogKey(event, focusable, onClose);
+      }
       document.addEventListener("keydown", handleKey);
       if (closeRef.current) closeRef.current.focus();
-      return function () { document.removeEventListener("keydown", handleKey); };
-    }, [onClose]);
+      return function () {
+        document.removeEventListener("keydown", handleKey);
+        if (returnFocus && returnFocus.isConnected !== false) returnFocus.focus();
+      };
+    }, [onClose, returnFocus]);
 
     function value(raw, fallback) {
       return raw === null || raw === undefined || raw === "" ? (fallback || "—") : String(raw);
@@ -82,6 +134,7 @@
       className: "dm-drawer-backdrop",
       onMouseDown: function (event) { if (event.target === event.currentTarget) onClose(); }
     }, h("aside", {
+      ref: dialogRef,
       className: "dm-drawer",
       role: "dialog",
       "aria-modal": "true",
@@ -160,6 +213,11 @@
     const [secret, setSecret] = React.useState(null);
     const [error, setError] = React.useState("");
     const [loading, setLoading] = React.useState(true);
+    const requestChannelRef = React.useRef(null);
+    const returnFocusRef = React.useRef(null);
+    const viewRef = React.useRef(view);
+    if (!requestChannelRef.current) requestChannelRef.current = createLatestRequestChannel();
+    viewRef.current = view;
 
     function endpoint(selected) {
       if (selected === "Policies") return "/policies";
@@ -169,33 +227,61 @@
     }
 
     function load(selected) {
+      const request = requestChannelRef.current.start();
       setLoading(true); setError("");
-      api(endpoint(selected)).then(function (result) { setData(result); })
-        .catch(function () { setData({ items: [] }); setError("Memory service unavailable (fail closed)."); })
-        .finally(function () { setLoading(false); });
+      api(endpoint(selected), { signal: request.signal }).then(function (result) {
+        if (!requestChannelRef.current.isCurrent(request.generation) || viewRef.current !== selected) return;
+        setData(result);
+      }).catch(function (caught) {
+        if (!requestChannelRef.current.isCurrent(request.generation) || viewRef.current !== selected) return;
+        if (caught && caught.name === "AbortError") return;
+        setData({ items: [] }); setError("Memory service unavailable (fail closed).");
+      }).finally(function () {
+        if (!requestChannelRef.current.isCurrent(request.generation) || viewRef.current !== selected) return;
+        requestChannelRef.current.finish(request.generation);
+        setLoading(false);
+      });
     }
 
-    React.useEffect(function () { setSecret(null); setSelectedEvent(null); load(view); }, [view]);
+    React.useEffect(function () {
+      setSecret(null); setSelectedEvent(null); load(view);
+      return function () { requestChannelRef.current.invalidate(); };
+    }, [view]);
+
+    function openEvent(item, returnFocus) {
+      returnFocusRef.current = returnFocus;
+      setSelectedEvent(item);
+    }
 
     function rotate(agent) {
+      const actionView = view;
       setError("");
       api("/agents/" + encodeURIComponent(agent) + "/rotate", { method: "POST" })
-        .then(function (result) { setSecret(result); load(view); })
-        .catch(function () { setSecret(null); setError("Rotation unavailable; no credential was issued."); });
+        .then(function (result) {
+          if (viewRef.current !== actionView) return;
+          setSecret(result); load(actionView);
+        })
+        .catch(function () {
+          if (viewRef.current !== actionView) return;
+          setSecret(null); setError("Rotation unavailable; no credential was issued.");
+        });
     }
 
     function revoke(agent) {
+      const actionView = view;
       setSecret(null); setError("");
       api("/agents/" + encodeURIComponent(agent) + "/revoke", { method: "POST" })
-        .then(function () { load(view); })
-        .catch(function () { setError("Revocation could not be verified; access is treated as unavailable."); });
+        .then(function () { if (viewRef.current === actionView) load(actionView); })
+        .catch(function () {
+          if (viewRef.current === actionView) setError("Revocation could not be verified; access is treated as unavailable.");
+        });
     }
 
     let body;
     if (loading) body = h("div", { className: "dm-empty" }, "Loading bounded view…");
     else if (view === "Policies") body = h(PolicyTable, { items: data.items });
     else if (view === "Agent Access") body = h(AgentAccess, { items: data.items, secret: secret, onRotate: rotate, onRevoke: revoke });
-    else body = h(EventTable, { items: data.items, onSelect: setSelectedEvent });
+    else body = h(EventTable, { items: data.items, onSelect: openEvent });
 
     return h("main", { className: "dm-page" },
       h("header", { className: "dm-header" }, h("div", null,
@@ -207,9 +293,17 @@
       })),
       error && h(ErrorBox, { message: error }),
       body,
-      selectedEvent && h(EventDetail, { item: selectedEvent, onClose: function () { setSelectedEvent(null); } })
+      selectedEvent && h(EventDetail, {
+        item: selectedEvent,
+        returnFocus: returnFocusRef.current,
+        onClose: function () { setSelectedEvent(null); }
+      })
     );
   }
 
+  window.__DAOS_MEMORY_INTERNALS__ = {
+    createLatestRequestChannel: createLatestRequestChannel,
+    handleDialogKey: handleDialogKey
+  };
   registry.register("daos_memory", MemoryPage);
 })();

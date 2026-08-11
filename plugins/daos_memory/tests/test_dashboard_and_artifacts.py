@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import tomllib
 
 import httpx
@@ -115,6 +116,58 @@ def test_event_rows_open_one_shared_read_only_detail_drawer_with_full_content():
     assert "api(" not in detail_source
     assert "dm-drawer" in style
     assert "dm-detail-content" in style
+
+
+def test_dashboard_internal_coordinators_abort_stale_requests_and_trap_dialog_focus():
+    source = (ROOT / "dashboard" / "dist" / "index.js").read_text()
+    program = f"""
+      global.AbortController = class {{
+        constructor() {{ this.signal = {{ aborted: false }}; }}
+        abort() {{ this.signal.aborted = true; }}
+      }};
+      global.window = {{
+        __HERMES_PLUGIN_SDK__: {{ React: {{}} }},
+        __HERMES_PLUGINS__: {{ register: function () {{}} }}
+      }};
+      global.document = {{ activeElement: null }};
+      eval({json.dumps(source)});
+      const hooks = window.__DAOS_MEMORY_INTERNALS__;
+      if (!hooks) throw new Error("missing testable coordinators");
+
+      const channel = hooks.createLatestRequestChannel();
+      const first = channel.start();
+      const second = channel.start();
+      if (!first.signal.aborted) throw new Error("previous request was not aborted");
+      if (channel.isCurrent(first.generation)) throw new Error("stale generation stayed current");
+      if (!channel.isCurrent(second.generation)) throw new Error("new generation is not current");
+      channel.invalidate();
+      if (!second.signal.aborted || channel.isCurrent(second.generation)) throw new Error("invalidate failed");
+
+      let closed = 0;
+      let prevented = 0;
+      const firstFocus = {{ focus: function () {{ document.activeElement = firstFocus; }} }};
+      const lastFocus = {{ focus: function () {{ document.activeElement = lastFocus; }} }};
+      document.activeElement = lastFocus;
+      hooks.handleDialogKey(
+        {{ key: "Tab", shiftKey: false, preventDefault: function () {{ prevented += 1; }} }},
+        [firstFocus, lastFocus], function () {{ closed += 1; }}
+      );
+      if (document.activeElement !== firstFocus || prevented !== 1) throw new Error("forward trap failed");
+      hooks.handleDialogKey(
+        {{ key: "Tab", shiftKey: true, preventDefault: function () {{ prevented += 1; }} }},
+        [firstFocus, lastFocus], function () {{ closed += 1; }}
+      );
+      if (document.activeElement !== lastFocus || prevented !== 2) throw new Error("reverse trap failed");
+      hooks.handleDialogKey(
+        {{ key: "Escape", preventDefault: function () {{ prevented += 1; }} }},
+        [firstFocus, lastFocus], function () {{ closed += 1; }}
+      );
+      if (closed !== 1 || prevented !== 3) throw new Error("escape close failed");
+    """
+    result = subprocess.run(["node", "-e", program], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "requestChannelRef.current.start()" in source
+    assert "returnFocus" in source
 
 
 def test_migration_has_only_required_core_tables_and_hashed_credential_columns():

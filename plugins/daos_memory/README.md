@@ -84,6 +84,11 @@ Agent endpoints are fixed:
 - `GET /v1/events/{id}` — exact canonical event readback.
 - `POST /v1/events/{id}/supersede`
 
+Writes without temporal fields represent the current session and use database/server time.
+Explicit temporal fields are treated as a historical import and cannot become `CURRENT` or
+supersede a current event. `event_type=HISTORY_IMPORT` is fail-closed unless both
+`occurred_at` and `source_session_at` are timezone-aware and present.
+
 Owner endpoints under `/v1/admin` rotate/revoke access and feed the authenticated
 dashboard proxy. Rotation is the only response that contains a plaintext
 bootstrap key. Registry persistence contains hashes only. Revocation clears

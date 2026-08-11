@@ -204,7 +204,11 @@ components:
         memory_type:
           type: string
           enum: [STRATEGY, ASSESSMENT, SESSION_SUMMARY]
-        event_type: {type: string, minLength: 1, maxLength: 80}
+        event_type:
+          type: string
+          minLength: 1
+          maxLength: 80
+          description: Use HISTORY_IMPORT only with both occurred_at and source_session_at; undated historical imports fail closed.
         title: {type: string, minLength: 1, maxLength: 240}
         summary: {type: string, minLength: 1, maxLength: 1200}
         content: {type: string, minLength: 1, maxLength: 8000}

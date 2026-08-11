@@ -170,11 +170,13 @@ def test_action_write_forwards_timezone_aware_history_import_times_only():
     missing_start = client.post("/zeus-memory/v1/events", headers=HEADERS, json={
         **base, "effective_to": "2026-06-19T09:00:00+00:00",
     })
+    undated_history = client.post("/zeus-memory/v1/events", headers=HEADERS, json=base)
 
     assert accepted.status_code == 200
-    assert rejected.status_code == missing_start.status_code == 400
-    write_call = next(call for call in upstream.calls if call[0] == "write_event")
-    forwarded = write_call[2]
+    assert rejected.status_code == missing_start.status_code == undated_history.status_code == 400
+    write_calls = [call for call in upstream.calls if call[0] == "write_event"]
+    assert len(write_calls) == 1
+    forwarded = write_calls[0][2]
     for field in ("occurred_at", "effective_from", "effective_to", "source_session_at"):
         parsed = datetime.fromisoformat(forwarded[field].replace("Z", "+00:00"))
         assert parsed.tzinfo is not None
