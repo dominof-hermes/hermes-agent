@@ -119,6 +119,10 @@ def test_zeus_action_systemd_is_private_bounded_and_uses_a_secret_file():
     assert "MemoryMax=" in unit
     assert "NoNewPrivileges=true" in unit
     assert "172.18.0.1" in unit
+    assert "172.18.0.4/32" in unit
+    assert "br-a0bd2b780836" in unit
+    assert "ExecStartPre=+" in unit
+    assert "ExecStopPost=+" in unit
     assert "8793" in unit
     assert "token=" not in unit.lower()
 
