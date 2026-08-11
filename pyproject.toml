@@ -353,6 +353,9 @@ plugins = [
   "**/README.md",
   "daos_memory/migrations/001_daos_memory_v01.sql",
   "daos_memory/systemd/daos-memory.service",
+  "daos_memory/systemd/daos-zeus-memory-action.service",
+  "daos_memory/openapi/zeus_memory_action.yaml",
+  "daos_memory/nginx/zeus_memory_locations.conf",
   "daos_memory/requirements.txt",
 ]
 

@@ -16,6 +16,13 @@ not add a Hermes core/model tool and never runs inside the Hermes Gateway.
   bridge-scoped host Gateway liveness bridge for a containerized Dashboard. It
   validates the host Gateway PID/command and exposes only bounded `/health` and
   `/health/detailed` data; it does not proxy Gateway sessions or credentials.
+- `action_api.py` + `openapi/zeus_memory_action.yaml`: owner-authenticated GPT
+  Action adapter exposing exactly five Zeus Memory operations. A one-time
+  Bootstrap Key is exchanged for an opaque conversation `context_id`; the
+  internal access token remains server-side in volatile process memory.
+- `systemd/daos-zeus-memory-action.service`: private Docker-bridge listener for
+  the TLS reverse proxy. The stable GPT Action API key is read from a private
+  service-owned file, never from source, environment text, or the OpenAPI schema.
 
 ## Configure
 
@@ -72,6 +79,7 @@ Agent endpoints are fixed:
 - `GET /v1/current`
 - `GET /v1/history` — requires a product/topic/query filter.
 - `POST /v1/events`
+- `GET /v1/events/{id}` — exact canonical event readback.
 - `POST /v1/events/{id}/supersede`
 
 Owner endpoints under `/v1/admin` rotate/revoke access and feed the authenticated
@@ -82,6 +90,34 @@ superseded events remain searchable.
 
 Event metadata is accepted only as a JSON object whose compact UTF-8 encoding
 is at most 4096 bytes.
+
+### Zeus GPT Action contract
+
+The imported schema exposes exactly these `operationId` values:
+
+- `memory_bootstrap`
+- `memory_read_current`
+- `memory_search_history`
+- `memory_write`
+- `memory_read_event`
+
+The GPT editor uses **API Key / Bearer** authentication with one stable Action
+key stored in `/etc/daos-memory/zeus-action.token`. That key authenticates the
+OpenAI-to-adapter boundary only. The Owner-issued Zeus Bootstrap Key is a
+separate one-time request value consumed by `memory_bootstrap`. The adapter
+returns a temporary opaque `context_id` and keeps the resulting Memory access
+token server-side; restarting the adapter invalidates all active contexts and
+requires a fresh Bootstrap Key. The adapter never logs request bodies.
+
+The OpenAPI schema and privacy policy are intentionally credential-free:
+
+- `GET /zeus-memory/openapi.yaml`
+- `GET /zeus-memory/privacy`
+
+Server/schema/direct-client success is not Zeus verification. Final acceptance
+requires a saved Custom GPT, a genuinely fresh Zeus conversation, an actual
+`memory_bootstrap` call, `memory_write`, exact `memory_read_event`, and database
+readback correlated to that hosted call.
 
 ## Operational checks
 

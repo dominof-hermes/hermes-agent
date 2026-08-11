@@ -130,6 +130,15 @@ class AsyncpgStore:
         pool = await self._get_pool()
         return await _insert_event(pool, event, self.timeout)
 
+    async def read_event(self, event_id: str):
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            f"SELECT {_EVENT_COLUMNS} FROM daos_memory.context_events WHERE id=$1::uuid",
+            event_id,
+            timeout=self.timeout,
+        )
+        return _record(row) if row else None
+
     async def supersede_event(self, old_id: str, actor_id: str, event: dict[str, Any]):
         pool = await self._get_pool()
         async with pool.acquire() as conn:

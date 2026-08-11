@@ -148,6 +148,10 @@ class FakeStore:
         self.events.append(row)
         return deepcopy(row)
 
+    async def read_event(self, event_id):
+        row = next((e for e in self.events if e["id"] == event_id), None)
+        return deepcopy(row) if row else None
+
     async def supersede_event(self, old_id, actor_id, event):
         old = next((e for e in self.events if e["id"] == old_id and e["status"] == "CURRENT"
                     and e["actor"] == actor_id
@@ -257,6 +261,7 @@ def test_bootstrap_is_current_first_scoped_and_bounded_without_history(client, s
     assert {p["category"] for p in payload["role_principles"]} == {"STRATEGY"}
     assert all(e["product"] == "DAOS" and e["topic"] == "memory" for e in payload["current_context"])
     assert {e["title"] for e in payload["owner_decisions"]} == {"Owner chose API"}
+    assert all("source_ref" in e for key in ("current_context", "owner_decisions", "next_actions") for e in payload[key])
     assert "Owner follow-up" in {e["title"] for e in payload["next_actions"]}
     assert "Owner follow-up" not in {e["title"] for e in payload["owner_decisions"]}
     assert "Do not include" not in repr(payload)
@@ -280,6 +285,24 @@ def test_current_supersede_and_bounded_history_retain_old_event(client, store):
     history = client.get("/v1/history", headers=headers, params={"topic": "memory", "limit": 999}).json()["items"]
     assert len(history) <= 25
     assert any(e["id"] == old_id and e["status"] == "SUPERSEDED" for e in history)
+
+
+def test_read_event_requires_agent_token_and_returns_exact_event(client, store):
+    event_id = next(e["id"] for e in store.events if e["title"] == "Owner chose API")
+    assert client.get(f"/v1/events/{event_id}").status_code == 401
+
+    token, _ = access(client)
+    response = client.get(
+        f"/v1/events/{event_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == event_id
+    assert client.get(
+        f"/v1/events/{uuid4()}",
+        headers={"Authorization": f"Bearer {token}"},
+    ).status_code == 404
 
 
 @pytest.mark.parametrize("title", ["Owner chose API", "Verified benchmark", "Apollo current note"])

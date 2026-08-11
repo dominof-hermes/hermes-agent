@@ -1,0 +1,41 @@
+[Unit]
+Description=DAOS Zeus Shared Memory GPT Action Adapter
+After=network-online.target daos-memory.service
+Wants=network-online.target
+Requires=daos-memory.service
+
+[Service]
+Type=simple
+User=daos-memory
+Group=daos-memory
+WorkingDirectory=/opt/daos-memory/current
+Environment=PYTHONPATH=/opt/daos-memory/current
+Environment=DAOS_MEMORY_ACTION_TOKEN_FILE=/etc/daos-memory/zeus-action.token
+Environment=DAOS_MEMORY_UPSTREAM_URL=http://172.18.0.1:8791
+Environment=DAOS_MEMORY_ACTION_HOST=172.18.0.1
+Environment=DAOS_MEMORY_ACTION_PORT=8793
+ExecStart=/opt/daos-memory/current/venv/bin/python -m plugins.daos_memory.action_api
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+MemoryMax=128M
+TasksMax=64
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -144,6 +144,14 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
         event = _agent_event(agent, body)
         return await bounded(store.write_event(event))
 
+    @app.get("/v1/events/{event_id}")
+    async def read_event(event_id: UUID, agent: dict[str, Any] = Depends(agent_auth)):
+        del agent
+        row = await bounded(store.read_event(str(event_id)))
+        if not row:
+            raise HTTPException(status_code=404, detail="event not found")
+        return row
+
     @app.post("/v1/events/{event_id}/supersede")
     async def supersede(event_id: UUID, body: EventWrite, agent: dict[str, Any] = Depends(agent_auth)):
         _authorize_write(agent, body)
@@ -215,7 +223,7 @@ def _agent_event(agent: dict[str, Any], body: EventWrite) -> dict[str, Any]:
 
 
 def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
-    keys = ("id", "created_at", "product", "topic", "memory_type", "event_type", "title", "summary", "status", "authority_level", "actor", "work_id")
+    keys = ("id", "created_at", "product", "topic", "memory_type", "event_type", "title", "summary", "status", "authority_level", "actor", "work_id", "source_ref")
     compact = {key: event.get(key) for key in keys}
     compact["summary"] = str(compact.get("summary") or "")[:400]
     return compact

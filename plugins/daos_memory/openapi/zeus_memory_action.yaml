@@ -1,0 +1,285 @@
+openapi: 3.1.0
+info:
+  title: DAOS Zeus Shared Memory Action
+  version: 0.1.0
+  description: >-
+    Owner-authorized Shared Memory tools for Zeus. Call memory_bootstrap once with a
+    one-time Bootstrap Key, retain the returned context_id inside the conversation,
+    and pass that context_id to all later operations. Never repeat or expose keys.
+servers:
+  - url: https://ax.dominof.com
+security:
+  - BearerAuth: []
+paths:
+  /zeus-memory/v1/bootstrap:
+    post:
+      operationId: memory_bootstrap
+      summary: Bootstrap a fresh Zeus conversation from DAOS Shared Memory
+      description: Consumes the Owner-issued one-time Bootstrap Key and returns bounded current context plus a temporary context_id. The key must never be repeated in the answer.
+      x-openai-isConsequential: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/BootstrapRequest'}
+      responses:
+        '200':
+          description: Bootstrap context and opaque temporary context handle. Internal access credentials are never returned.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BootstrapResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /zeus-memory/v1/current:
+    post:
+      operationId: memory_read_current
+      summary: Read bounded current Shared Memory
+      x-openai-isConsequential: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CurrentRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/EventList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /zeus-memory/v1/history:
+    post:
+      operationId: memory_search_history
+      summary: Search bounded superseded Shared Memory history
+      description: At least one of product, topic, or query is required.
+      x-openai-isConsequential: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/HistoryRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/EventList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /zeus-memory/v1/events:
+    post:
+      operationId: memory_write
+      summary: Write one Zeus event to Shared Memory
+      description: Zeus may write only its registry-authorized memory types and non-protected authority levels. The server fixes source_interface to chatgpt_zeus_action.
+      x-openai-isConsequential: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/WriteRequest'}
+      responses:
+        '200':
+          description: Persisted event with its canonical event ID and source reference.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Event'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /zeus-memory/v1/event:
+    post:
+      operationId: memory_read_event
+      summary: Read one exact Shared Memory event by canonical event ID
+      x-openai-isConsequential: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/EventRequest'}
+      responses:
+        '200':
+          description: Exact event readback.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Event'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+components:
+  securitySchemes:
+    BearerAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+  responses:
+    EventList:
+      description: Bounded event list.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/EventList'}
+    BadRequest:
+      description: Sanitized invalid request.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unauthorized:
+      description: Missing/invalid Action API key or expired context handle.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Forbidden:
+      description: Zeus writer scope does not permit this event.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    NotFound:
+      description: Event does not exist.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unavailable:
+      description: Bounded sanitized temporary failure.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+  schemas:
+    ContextId:
+      type: string
+      minLength: 32
+      maxLength: 128
+      description: Opaque temporary handle returned by memory_bootstrap. It is useful only with the configured Action API key.
+    Product:
+      type: string
+      minLength: 1
+      maxLength: 120
+    Topic:
+      type: string
+      minLength: 1
+      maxLength: 160
+    BootstrapRequest:
+      type: object
+      additionalProperties: false
+      required: [bootstrap_key]
+      properties:
+        bootstrap_key:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+          description: One-time Zeus Bootstrap Key issued by Owner through Agent Access.
+        product:
+          oneOf: [{$ref: '#/components/schemas/Product'}, {type: 'null'}]
+        topic:
+          oneOf: [{$ref: '#/components/schemas/Topic'}, {type: 'null'}]
+    CurrentRequest:
+      type: object
+      additionalProperties: false
+      required: [context_id]
+      properties:
+        context_id: {$ref: '#/components/schemas/ContextId'}
+        product:
+          oneOf: [{$ref: '#/components/schemas/Product'}, {type: 'null'}]
+        topic:
+          oneOf: [{$ref: '#/components/schemas/Topic'}, {type: 'null'}]
+        limit: {type: integer, minimum: 1, maximum: 25, default: 25}
+    HistoryRequest:
+      type: object
+      additionalProperties: false
+      required: [context_id]
+      properties:
+        context_id: {$ref: '#/components/schemas/ContextId'}
+        product:
+          oneOf: [{$ref: '#/components/schemas/Product'}, {type: 'null'}]
+        topic:
+          oneOf: [{$ref: '#/components/schemas/Topic'}, {type: 'null'}]
+        query:
+          oneOf: [{type: string, minLength: 1, maxLength: 240}, {type: 'null'}]
+        limit: {type: integer, minimum: 1, maximum: 25, default: 25}
+    WriteRequest:
+      type: object
+      additionalProperties: false
+      required: [context_id, product, topic, memory_type, event_type, title, summary, content, authority_level]
+      properties:
+        context_id: {$ref: '#/components/schemas/ContextId'}
+        product: {$ref: '#/components/schemas/Product'}
+        topic: {$ref: '#/components/schemas/Topic'}
+        memory_type:
+          type: string
+          enum: [STRATEGY, ASSESSMENT, SESSION_SUMMARY]
+        event_type: {type: string, minLength: 1, maxLength: 80}
+        title: {type: string, minLength: 1, maxLength: 240}
+        summary: {type: string, minLength: 1, maxLength: 1200}
+        content: {type: string, minLength: 1, maxLength: 8000}
+        authority_level:
+          type: string
+          enum: [AGENT_ASSESSMENT, HYPOTHESIS, OPERATIONAL_STATE]
+        thread_id:
+          oneOf: [{type: string, maxLength: 160}, {type: 'null'}]
+        work_id:
+          oneOf: [{type: string, maxLength: 160}, {type: 'null'}]
+        source_ref:
+          oneOf: [{type: string, maxLength: 500}, {type: 'null'}]
+        metadata: {type: object, additionalProperties: true, default: {}}
+    EventRequest:
+      type: object
+      additionalProperties: false
+      required: [context_id, event_id]
+      properties:
+        context_id: {$ref: '#/components/schemas/ContextId'}
+        event_id: {type: string, format: uuid}
+    Event:
+      type: object
+      additionalProperties: true
+      required: [id]
+      properties:
+        id: {type: string, format: uuid}
+        source_ref:
+          oneOf: [{type: string}, {type: 'null'}]
+        status: {type: string}
+    EventList:
+      type: object
+      additionalProperties: false
+      required: [items, count]
+      properties:
+        items:
+          type: array
+          maxItems: 25
+          items: {$ref: '#/components/schemas/Event'}
+        count: {type: integer, minimum: 0, maximum: 25}
+    BootstrapResponse:
+      type: object
+      additionalProperties: true
+      required: [agent_id, access_expires_at, scopes, current_context, owner_decisions, next_actions, history, context_id, bootstrap_event_ids, bootstrap_source_refs]
+      properties:
+        agent_id: {type: string, const: zeus}
+        access_expires_at: {type: string, format: date-time}
+        scopes:
+          type: array
+          maxItems: 8
+          items: {type: string}
+        global_principles: {type: array, maxItems: 10, items: {type: object}}
+        role_principles: {type: array, maxItems: 10, items: {type: object}}
+        current_context: {type: array, maxItems: 10, items: {type: object}}
+        owner_decisions: {type: array, maxItems: 5, items: {type: object}}
+        next_actions: {type: array, maxItems: 5, items: {type: object}}
+        history: {type: array, maxItems: 0, items: {type: object}}
+        context_id: {$ref: '#/components/schemas/ContextId'}
+        bootstrap_event_ids:
+          type: array
+          maxItems: 20
+          items: {type: string, format: uuid}
+        bootstrap_source_refs:
+          type: array
+          maxItems: 20
+          items: {type: string, maxLength: 500}
+    Error:
+      type: object
+      additionalProperties: false
+      required: [ok, error]
+      properties:
+        ok: {type: boolean, const: false}
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code: {type: string, pattern: '^[A-Z][A-Z0-9_]{0,63}$'}
+            message: {type: string, maxLength: 200}

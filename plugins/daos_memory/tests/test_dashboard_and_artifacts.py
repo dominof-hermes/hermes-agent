@@ -110,12 +110,48 @@ def test_systemd_template_is_separate_bounded_and_hardened():
     assert "hermes gateway" not in unit.lower()
 
 
+def test_zeus_action_systemd_is_private_bounded_and_uses_a_secret_file():
+    unit = (ROOT / "systemd" / "daos-zeus-memory-action.service").read_text()
+    assert "User=daos-memory" in unit
+    assert "DAOS_MEMORY_ACTION_TOKEN_FILE=/etc/daos-memory/zeus-action.token" in unit
+    assert "DAOS_MEMORY_UPSTREAM_URL=http://172.18.0.1:8791" in unit
+    assert "plugins.daos_memory.action_api" in unit
+    assert "MemoryMax=" in unit
+    assert "NoNewPrivileges=true" in unit
+    assert "172.18.0.1" in unit
+    assert "8793" in unit
+    assert "token=" not in unit.lower()
+
+
+def test_zeus_action_nginx_locations_are_exact_host_gated_and_bounded():
+    config = (ROOT / "nginx" / "zeus_memory_locations.conf").read_text()
+    for path in (
+        "/zeus-memory/v1/bootstrap",
+        "/zeus-memory/v1/current",
+        "/zeus-memory/v1/history",
+        "/zeus-memory/v1/events",
+        "/zeus-memory/v1/event",
+    ):
+        assert f"location = {path}" in config
+    assert 'if ($host != "ax.dominof.com") { return 404; }' in config
+    assert config.count("if ($request_method != POST) { return 405; }") == 5
+    assert "location ^~ /zeus-memory/" in config
+    assert "location ~* ^/zeus-memory" in config
+    assert "client_max_body_size 16k" in config
+    assert "proxy_pass http://172.18.0.1:8793" in config
+    assert "proxy_read_timeout 40s" in config
+    assert "Authorization" not in config
+
+
 def test_wheel_package_data_declares_only_daos_runtime_artifacts():
     pyproject = tomllib.loads((ROOT.parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     plugin_data = pyproject["tool"]["setuptools"]["package-data"]["plugins"]
     for artifact in (
         "daos_memory/migrations/001_daos_memory_v01.sql",
         "daos_memory/systemd/daos-memory.service",
+        "daos_memory/systemd/daos-zeus-memory-action.service",
+        "daos_memory/openapi/zeus_memory_action.yaml",
+        "daos_memory/nginx/zeus_memory_locations.conf",
         "daos_memory/requirements.txt",
     ):
         assert artifact in plugin_data
