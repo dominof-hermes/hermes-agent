@@ -14,10 +14,10 @@ Environment=DAOS_MEMORY_ACTION_TOKEN_FILE=/etc/daos-memory/zeus-action.token
 Environment=DAOS_MEMORY_UPSTREAM_URL=http://172.18.0.1:8791
 Environment=DAOS_MEMORY_ACTION_HOST=172.18.0.1
 Environment=DAOS_MEMORY_ACTION_PORT=8793
-# Permit only the current NPM container on the existing dominof-network bridge.
-ExecStartPre=+/bin/sh -c '/usr/sbin/iptables -C INPUT -i br-a0bd2b780836 -s 172.18.0.4/32 -d 172.18.0.1 -p tcp --dport 8793 -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I INPUT 5 -i br-a0bd2b780836 -s 172.18.0.4/32 -d 172.18.0.1 -p tcp --dport 8793 -j ACCEPT'
+# Permit only containers on the existing private dominof-network bridge.
+ExecStartPre=+/bin/sh -c '/usr/sbin/iptables -C INPUT -i br-a0bd2b780836 -s 172.18.0.0/16 -d 172.18.0.1 -p tcp --dport 8793 -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I INPUT 5 -i br-a0bd2b780836 -s 172.18.0.0/16 -d 172.18.0.1 -p tcp --dport 8793 -j ACCEPT'
 ExecStart=/opt/daos-memory/current/venv/bin/python -m plugins.daos_memory.action_api
-ExecStopPost=+/bin/sh -c '/usr/sbin/iptables -C INPUT -i br-a0bd2b780836 -s 172.18.0.4/32 -d 172.18.0.1 -p tcp --dport 8793 -j ACCEPT 2>/dev/null && /usr/sbin/iptables -D INPUT -i br-a0bd2b780836 -s 172.18.0.4/32 -d 172.18.0.1 -p tcp --dport 8793 -j ACCEPT || true'
+ExecStopPost=+/bin/sh -c '/usr/sbin/iptables -C INPUT -i br-a0bd2b780836 -s 172.18.0.0/16 -d 172.18.0.1 -p tcp --dport 8793 -j ACCEPT 2>/dev/null && /usr/sbin/iptables -D INPUT -i br-a0bd2b780836 -s 172.18.0.0/16 -d 172.18.0.1 -p tcp --dport 8793 -j ACCEPT || true'
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s
