@@ -28,6 +28,16 @@
     return EVENT_ID_PATTERN.test(eventId) ? eventId : null;
   }
 
+  const INITIAL_EVENT_ID = eventIdFromPath(window.location && window.location.pathname);
+  if (INITIAL_EVENT_ID) {
+    const bootstrapState = {
+      dmMemoryDirect: INITIAL_EVENT_ID,
+      dmMemoryList: { view: "Current", scrollY: 0 }
+    };
+    window.history.replaceState(bootstrapState, "", "/memory");
+    window.dispatchEvent(new PopStateEvent("popstate", { state: bootstrapState }));
+  }
+
   function createLatestRequestChannel() {
     let generation = 0;
     let controller = null;
@@ -314,8 +324,13 @@
         }
       }
       window.addEventListener("popstate", handlePopState);
-      const directEventId = eventIdFromPath(window.location.pathname);
-      if (directEventId) loadDirectEvent(directEventId);
+      const directEventId = INITIAL_EVENT_ID || eventIdFromPath(window.location.pathname);
+      if (directEventId) {
+        if (INITIAL_EVENT_ID) {
+          window.history.replaceState(window.history.state, "", eventPath(INITIAL_EVENT_ID));
+        }
+        loadDirectEvent(directEventId);
+      }
       return function () {
         window.removeEventListener("popstate", handlePopState);
         detailChannelRef.current.invalidate();
@@ -425,7 +440,8 @@
     createLatestRequestChannel: createLatestRequestChannel,
     handleDialogKey: handleDialogKey,
     eventPath: eventPath,
-    eventIdFromPath: eventIdFromPath
+    eventIdFromPath: eventIdFromPath,
+    initialEventId: INITIAL_EVENT_ID
   };
   registry.register("daos_memory", MemoryPage);
 })();

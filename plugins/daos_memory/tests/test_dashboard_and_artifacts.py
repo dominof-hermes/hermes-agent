@@ -139,17 +139,26 @@ def test_event_rows_open_one_shared_read_only_detail_drawer_with_full_content():
 def test_event_detail_uses_direct_url_and_browser_history_without_mutation_controls():
     source = (ROOT / "dashboard" / "dist" / "index.js").read_text()
     program = f"""
+      const replacements = [];
       global.window = {{
         __HERMES_PLUGIN_SDK__: {{ React: {{}} }},
         __HERMES_PLUGINS__: {{ register: function () {{}} }},
-        location: {{ pathname: "/memory/events/11111111-1111-4111-8111-111111111111" }}
+        location: {{ pathname: "/memory/events/11111111-1111-4111-8111-111111111111" }},
+        history: {{
+          state: null,
+          replaceState: function (state, title, path) {{ this.state = state; replacements.push(path); window.location.pathname = path; }}
+        }},
+        dispatchEvent: function () {{}}
       }};
+      global.PopStateEvent = function () {{}};
       global.document = {{ activeElement: null }};
       eval({json.dumps(source)});
       const hooks = window.__DAOS_MEMORY_INTERNALS__;
       const id = "11111111-1111-4111-8111-111111111111";
       if (hooks.eventPath(id) !== "/memory/events/" + id) throw new Error("event path mismatch");
-      if (hooks.eventIdFromPath(window.location.pathname) !== id) throw new Error("deep link parse failed");
+      if (hooks.eventIdFromPath("/memory/events/" + id) !== id) throw new Error("deep link parse failed");
+      if (hooks.initialEventId !== id) throw new Error("initial event not captured");
+      if (replacements[0] !== "/memory") throw new Error("shell bootstrap did not claim memory route");
       if (hooks.eventIdFromPath("/memory/events/not-a-uuid") !== null) throw new Error("invalid id accepted");
       if (hooks.eventIdFromPath("/memory") !== null) throw new Error("list route parsed as detail");
     """
