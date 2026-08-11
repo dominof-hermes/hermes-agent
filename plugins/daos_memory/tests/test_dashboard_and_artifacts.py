@@ -88,6 +88,31 @@ def test_dashboard_artifacts_define_top_level_memory_views():
     assert "owner-secret" not in script
 
 
+def test_event_rows_open_one_shared_read_only_detail_drawer_with_full_content():
+    script = (ROOT / "dashboard" / "dist" / "index.js").read_text()
+    style = (ROOT / "dashboard" / "dist" / "style.css").read_text()
+
+    table_source = script[script.index("function EventTable"):script.index("function EventDetail")]
+    detail_source = script[script.index("function EventDetail"):script.index("function PolicyTable")]
+    for label in (
+        "Event ID", "Product", "Topic", "Title", "Summary", "Full Content",
+        "Memory Type", "Event Type", "Status", "Authority Level", "Actor",
+        "Actor Role", "Source Interface", "Source Ref", "Created At", "Updated At",
+        "Supersedes", "Related Event",
+    ):
+        assert label in detail_source
+    assert "item.content" not in table_source
+    assert "item.content" in detail_source
+    assert "onClick" in table_source
+    assert "onKeyDown" in table_source
+    assert 'role: "button"' in table_source
+    assert 'role: "dialog"' in detail_source
+    assert "Read-only event detail" in detail_source
+    assert "api(" not in detail_source
+    assert "dm-drawer" in style
+    assert "dm-detail-content" in style
+
+
 def test_migration_has_only_required_core_tables_and_hashed_credential_columns():
     sql = (ROOT / "migrations" / "001_daos_memory_v01.sql").read_text().lower()
     for table in ("context_events", "canonical_policies", "agent_registry", "context_relations"):

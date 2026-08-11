@@ -17,6 +17,7 @@
 
   function EventTable(props) {
     const items = props.items || [];
+    const onSelect = props.onSelect;
     if (!items.length) return h("div", { className: "dm-empty" }, "No records in this bounded view.");
     return h("div", { className: "dm-table-wrap" }, h("table", { className: "dm-table" },
       h("thead", null, h("tr", null,
@@ -24,7 +25,21 @@
         h("th", null, "Status"), h("th", null, "Updated"), h("th", null, "Actor")
       )),
       h("tbody", null, items.map(function (item) {
-        return h("tr", { key: item.id },
+        function openDetail() { onSelect(item); }
+        return h("tr", {
+          key: item.id,
+          className: "dm-event-row",
+          role: "button",
+          tabIndex: 0,
+          "aria-label": "Open event detail: " + (item.title || item.id),
+          onClick: openDetail,
+          onKeyDown: function (event) {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              openDetail();
+            }
+          }
+        },
           h("td", null, h("strong", null, item.topic), h("small", null, item.product)),
           h("td", null, h("strong", null, item.title), h("p", null, item.summary)),
           h("td", null, item.memory_type + " · " + item.authority_level),
@@ -33,6 +48,63 @@
           h("td", null, item.actor)
         );
       }))
+    ));
+  }
+
+  function EventDetail(props) {
+    const item = props.item;
+    const onClose = props.onClose;
+    const closeRef = React.useRef(null);
+
+    React.useEffect(function () {
+      function handleKey(event) { if (event.key === "Escape") onClose(); }
+      document.addEventListener("keydown", handleKey);
+      if (closeRef.current) closeRef.current.focus();
+      return function () { document.removeEventListener("keydown", handleKey); };
+    }, [onClose]);
+
+    function value(raw, fallback) {
+      return raw === null || raw === undefined || raw === "" ? (fallback || "—") : String(raw);
+    }
+    function date(raw, fallback) {
+      return raw ? new Date(raw).toLocaleString() : (fallback || "—");
+    }
+    function field(label, raw, wide, extraClass) {
+      return h("div", { className: "dm-detail-field" + (wide ? " wide" : "") + (extraClass ? " " + extraClass : "") },
+        h("dt", null, label), h("dd", null, value(raw))
+      );
+    }
+
+    return h("div", {
+      className: "dm-drawer-backdrop",
+      onMouseDown: function (event) { if (event.target === event.currentTarget) onClose(); }
+    }, h("aside", {
+      className: "dm-drawer",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-labelledby": "dm-event-detail-title"
+    },
+      h("header", { className: "dm-drawer-header" }, h("div", null,
+        h("span", { className: "dm-kicker" }, "Read-only event detail"),
+        h("h2", { id: "dm-event-detail-title" }, value(item.title, "Memory Event"))
+      ), h("button", { ref: closeRef, onClick: onClose, "aria-label": "Close event detail" }, "Close")),
+      h("dl", { className: "dm-detail-grid" },
+        field("Event ID", item.id, true, "mono"),
+        field("Product", item.product), field("Topic", item.topic),
+        field("Title", item.title, true),
+        field("Summary", item.summary, true),
+        h("div", { className: "dm-detail-field wide dm-detail-content" },
+          h("dt", null, "Full Content"), h("dd", null, value(item.content))
+        ),
+        field("Memory Type", item.memory_type), field("Event Type", item.event_type),
+        field("Status", item.status), field("Authority Level", item.authority_level),
+        field("Actor", item.actor), field("Actor Role", item.actor_role),
+        field("Source Interface", item.source_interface), field("Source Ref", item.source_ref, true),
+        field("Created At", date(item.created_at)),
+        field("Updated At", date(item.updated_at, "— (immutable event)")),
+        field("Supersedes", item.supersedes_id, true, "mono"),
+        field("Related Event", item.related_event_id || item.related_event, true, "mono")
+      )
     ));
   }
 
@@ -77,6 +149,7 @@
   function MemoryPage() {
     const [view, setView] = React.useState("Current");
     const [data, setData] = React.useState({ items: [] });
+    const [selectedEvent, setSelectedEvent] = React.useState(null);
     const [secret, setSecret] = React.useState(null);
     const [error, setError] = React.useState("");
     const [loading, setLoading] = React.useState(true);
@@ -95,7 +168,7 @@
         .finally(function () { setLoading(false); });
     }
 
-    React.useEffect(function () { setSecret(null); load(view); }, [view]);
+    React.useEffect(function () { setSecret(null); setSelectedEvent(null); load(view); }, [view]);
 
     function rotate(agent) {
       setError("");
@@ -115,7 +188,7 @@
     if (loading) body = h("div", { className: "dm-empty" }, "Loading bounded view…");
     else if (view === "Policies") body = h(PolicyTable, { items: data.items });
     else if (view === "Agent Access") body = h(AgentAccess, { items: data.items, secret: secret, onRotate: rotate, onRevoke: revoke });
-    else body = h(EventTable, { items: data.items });
+    else body = h(EventTable, { items: data.items, onSelect: setSelectedEvent });
 
     return h("main", { className: "dm-page" },
       h("header", { className: "dm-header" }, h("div", null,
@@ -126,7 +199,8 @@
         return h("button", { key: name, className: name === view ? "active" : "", onClick: function () { setView(name); } }, name);
       })),
       error && h(ErrorBox, { message: error }),
-      body
+      body,
+      selectedEvent && h(EventDetail, { item: selectedEvent, onClose: function () { setSelectedEvent(null); } })
     );
   }
 
