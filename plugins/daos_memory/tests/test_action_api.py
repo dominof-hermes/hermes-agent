@@ -171,9 +171,12 @@ def test_action_write_forwards_timezone_aware_history_import_times_only():
         **base, "effective_to": "2026-06-19T09:00:00+00:00",
     })
     undated_history = client.post("/zeus-memory/v1/events", headers=HEADERS, json=base)
+    padded_undated_history = client.post("/zeus-memory/v1/events", headers=HEADERS, json={
+        **base, "event_type": " HISTORY_IMPORT ",
+    })
 
     assert accepted.status_code == 200
-    assert rejected.status_code == missing_start.status_code == undated_history.status_code == 400
+    assert rejected.status_code == missing_start.status_code == undated_history.status_code == padded_undated_history.status_code == 400
     write_calls = [call for call in upstream.calls if call[0] == "write_event"]
     assert len(write_calls) == 1
     forwarded = write_calls[0][2]

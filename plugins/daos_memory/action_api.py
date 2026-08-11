@@ -80,6 +80,14 @@ class WriteBody(ContextBody):
     source_session_at: AwareDatetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("event_type")
+    @classmethod
+    def event_type_is_canonical(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("event_type must not be blank")
+        return normalized
+
     @model_validator(mode="after")
     def temporal_contract_is_valid(self):
         if self.event_type.upper() == "HISTORY_IMPORT":

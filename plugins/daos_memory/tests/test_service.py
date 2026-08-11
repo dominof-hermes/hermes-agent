@@ -439,9 +439,15 @@ def test_history_import_intent_requires_original_session_times_and_never_becomes
 
     write = client.post("/v1/events", headers=headers, json=payload)
     supersede = client.post(f"/v1/events/{old['id']}/supersede", headers=headers, json=payload)
+    padded_write = client.post("/v1/events", headers=headers, json={
+        **payload, "event_type": " HISTORY_IMPORT ",
+    })
+    padded_supersede = client.post(f"/v1/events/{old['id']}/supersede", headers=headers, json={
+        **payload, "event_type": " history_import ",
+    })
 
-    assert write.status_code == 422
-    assert supersede.status_code == 422
+    assert write.status_code == supersede.status_code == 422
+    assert padded_write.status_code == padded_supersede.status_code == 422
     assert store.events == before
     assert store.relations == []
 
