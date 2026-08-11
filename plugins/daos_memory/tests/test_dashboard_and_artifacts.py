@@ -160,6 +160,19 @@ def test_memory_domain_vhost_is_dedicated_tls_only_and_fail_closed():
     assert "server_proxy" not in config
 
 
+def test_memory_domain_certificate_has_durable_bounded_renewal():
+    service = (ROOT / "systemd" / "daos-memory-domain-cert-renew.service").read_text()
+    timer = (ROOT / "systemd" / "daos-memory-domain-cert-renew.timer").read_text()
+    assert "Type=oneshot" in service
+    assert "docker exec dominof-nginx-proxy-manager certbot renew" in service
+    assert "--cert-name npm-memory" in service
+    assert '--deploy-hook "nginx -s reload"' in service
+    assert "OnCalendar=" in timer
+    assert "Persistent=true" in timer
+    assert "RandomizedDelaySec=" in timer
+    assert "WantedBy=timers.target" in timer
+
+
 def test_wheel_package_data_declares_only_daos_runtime_artifacts():
     pyproject = tomllib.loads((ROOT.parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     plugin_data = pyproject["tool"]["setuptools"]["package-data"]["plugins"]
@@ -170,6 +183,8 @@ def test_wheel_package_data_declares_only_daos_runtime_artifacts():
         "daos_memory/openapi/zeus_memory_action.yaml",
         "daos_memory/nginx/zeus_memory_locations.conf",
         "daos_memory/nginx/memory_dominof_vhost.conf",
+        "daos_memory/systemd/daos-memory-domain-cert-renew.service",
+        "daos_memory/systemd/daos-memory-domain-cert-renew.timer",
         "daos_memory/requirements.txt",
     ):
         assert artifact in plugin_data
