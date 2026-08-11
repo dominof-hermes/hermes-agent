@@ -18,6 +18,15 @@ def _unavailable() -> tuple[int, dict[str, Any]]:
     return 503, {"status": "unavailable", "gateway_state": "stopped"}
 
 
+def _process_fingerprint_matches(pid: int, expected_start_time: object, proc_root: Path) -> bool:
+    try:
+        expected = int(expected_start_time)
+        current = int((proc_root / str(pid) / "stat").read_text(encoding="utf-8").split()[21])
+    except (OSError, IndexError, TypeError, ValueError):
+        return False
+    return expected > 0 and current == expected
+
+
 def _is_gateway_process(pid: int, proc_root: Path) -> bool:
     try:
         argv = (proc_root / str(pid) / "cmdline").read_bytes().split(b"\0")
@@ -39,7 +48,12 @@ def gateway_health(
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return _unavailable()
 
-    if raw.get("gateway_state") != "running" or pid <= 1 or not _is_gateway_process(pid, proc_root):
+    if (
+        raw.get("gateway_state") != "running"
+        or pid <= 1
+        or not _process_fingerprint_matches(pid, raw.get("start_time"), proc_root)
+        or not _is_gateway_process(pid, proc_root)
+    ):
         return _unavailable()
 
     try:
