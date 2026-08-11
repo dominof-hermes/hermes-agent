@@ -15,7 +15,9 @@ not add a Hermes core/model tool and never runs inside the Hermes Gateway.
 
 ## Configure
 
-Behavioral settings belong in `~/.hermes/config.yaml`:
+The hardened system service cannot read home directories (`ProtectHome=true`).
+Put its behavioral settings in `/etc/daos-memory/config.yaml`; the unit sets
+`HERMES_CONFIG_PATH` to that file:
 
 ```yaml
 daos_memory:
@@ -28,6 +30,11 @@ daos_memory:
   max_bootstrap_bytes: 24000
   max_results: 50
 ```
+
+The dashboard process is separate and continues to read `daos_memory.service_url`
+and `daos_memory.request_timeout_seconds` from the dashboard user's normal
+`~/.hermes/config.yaml`. Keep those two routing values aligned with the service
+configuration.
 
 Only secrets go in the systemd `EnvironmentFile` (mode `0600`):
 
@@ -68,6 +75,9 @@ dashboard proxy. Rotation is the only response that contains a plaintext
 bootstrap key. Registry persistence contains hashes only. Revocation clears
 both bootstrap and access credential state. There is no delete endpoint;
 superseded events remain searchable.
+
+Event metadata is accepted only as a JSON object whose compact UTF-8 encoding
+is at most 4096 bytes.
 
 ## Operational checks
 

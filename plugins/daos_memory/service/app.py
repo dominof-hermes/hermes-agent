@@ -87,7 +87,9 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
         events = await bounded(store.read_current(body.product, body.topic, min(settings.max_results, 20)))
         global_principles = [_compact_policy(p) for p in policies if p.get("category") == "GLOBAL"][:10]
         role_principles = [_compact_policy(p) for p in policies if p.get("category") != "GLOBAL"][:10]
-        decisions = [_compact_event(e) for e in events if e.get("authority_level") == "OWNER_DECISION" or e.get("memory_type") == "DECISION"][:5]
+        decisions = [_compact_event(e) for e in events
+                     if e.get("memory_type") == "DECISION"
+                     and e.get("authority_level") in {"OWNER_DECISION", "VERIFIED_EVIDENCE"}][:5]
         next_actions = [_compact_event(e) for e in events if e.get("memory_type") == "NEXT_ACTION"][:5]
         excluded = {e["id"] for e in decisions + next_actions}
         current = [_compact_event(e) for e in events if str(e.get("id")) not in excluded][:10]
@@ -145,7 +147,9 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
     @app.post("/v1/events/{event_id}/supersede")
     async def supersede(event_id: UUID, body: EventWrite, agent: dict[str, Any] = Depends(agent_auth)):
         _authorize_write(agent, body)
-        row = await bounded(store.supersede_event(str(event_id), _agent_event(agent, body)))
+        row = await bounded(store.supersede_event(
+            str(event_id), agent["agent_id"], _agent_event(agent, body),
+        ))
         if not row:
             raise HTTPException(status_code=404, detail="current event not found")
         return row

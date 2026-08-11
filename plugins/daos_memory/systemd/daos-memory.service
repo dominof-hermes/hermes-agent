@@ -8,6 +8,7 @@ Type=simple
 User=hermes
 Group=hermes
 WorkingDirectory=/opt/hermes-agent
+Environment=HERMES_CONFIG_PATH=/etc/daos-memory/config.yaml
 EnvironmentFile=/etc/daos-memory/daos-memory.env
 ExecStart=/opt/daos-memory/venv/bin/uvicorn plugins.daos_memory.service.main:app --host 127.0.0.1 --port 8791 --workers 1 --timeout-keep-alive 5 --limit-concurrency 64
 Restart=on-failure

@@ -30,7 +30,19 @@ class FakeStore:
                 "access_token_hash": None,
                 "access_expires_at": None,
                 "last_access_at": None,
-            }
+            },
+            "apollo": {
+                "agent_id": "apollo",
+                "status": "ACTIVE",
+                "role_categories": ["STRATEGY"],
+                "allowed_memory_types": ["STRATEGY", "ASSESSMENT", "SESSION_SUMMARY"],
+                "bootstrap_key_hash": None,
+                "bootstrap_expires_at": None,
+                "bootstrap_uses_remaining": 0,
+                "access_token_hash": None,
+                "access_expires_at": None,
+                "last_access_at": None,
+            },
         }
         self.policies = [
             {"id": "p-global", "category": "GLOBAL", "title": "Truth First", "content": "Verify claims", "status": "ACTIVE", "priority": 1},
@@ -40,8 +52,12 @@ class FakeStore:
         ]
         self.events = [
             self._event("DAOS", "memory", "DECISION", "Owner chose API", "CURRENT", "OWNER_DECISION", "owner"),
+            self._event("DAOS", "memory", "EVIDENCE", "Verified benchmark", "CURRENT", "VERIFIED_EVIDENCE", "owner"),
             self._event("Other", "unrelated", "DECISION", "Do not include", "CURRENT", "OWNER_DECISION", "owner"),
             self._event("DAOS", "memory", "NEXT_ACTION", "Ship v0.1", "CURRENT", "OPERATIONAL_STATE", "hermes"),
+            self._event("DAOS", "memory", "NEXT_ACTION", "Owner follow-up", "CURRENT", "OWNER_DECISION", "owner"),
+            self._event("DAOS", "memory", "ASSESSMENT", "Zeus current note", "CURRENT", "AGENT_ASSESSMENT", "zeus"),
+            self._event("DAOS", "memory", "ASSESSMENT", "Apollo current note", "CURRENT", "AGENT_ASSESSMENT", "apollo"),
             self._event("DAOS", "memory", "ASSESSMENT", "Old note", "SUPERSEDED", "AGENT_ASSESSMENT", "zeus"),
         ]
         self.relations = []
@@ -132,8 +148,11 @@ class FakeStore:
         self.events.append(row)
         return deepcopy(row)
 
-    async def supersede_event(self, old_id, event):
-        old = next((e for e in self.events if e["id"] == old_id and e["status"] == "CURRENT"), None)
+    async def supersede_event(self, old_id, actor_id, event):
+        old = next((e for e in self.events if e["id"] == old_id and e["status"] == "CURRENT"
+                    and e["actor"] == actor_id
+                    and e["authority_level"] in {"AGENT_ASSESSMENT", "HYPOTHESIS", "OPERATIONAL_STATE"}
+                    and e["product"] == event["product"] and e["topic"] == event["topic"]), None)
         if not old:
             return None
         old["status"] = "SUPERSEDED"
@@ -237,6 +256,9 @@ def test_bootstrap_is_current_first_scoped_and_bounded_without_history(client, s
     assert {p["category"] for p in payload["global_principles"]} == {"GLOBAL"}
     assert {p["category"] for p in payload["role_principles"]} == {"STRATEGY"}
     assert all(e["product"] == "DAOS" and e["topic"] == "memory" for e in payload["current_context"])
+    assert {e["title"] for e in payload["owner_decisions"]} == {"Owner chose API"}
+    assert "Owner follow-up" in {e["title"] for e in payload["next_actions"]}
+    assert "Owner follow-up" not in {e["title"] for e in payload["owner_decisions"]}
     assert "Do not include" not in repr(payload)
     assert len(client.get("/v1/current", headers={"Authorization": f"Bearer {token}"}, params={"product": "DAOS", "topic": "memory", "limit": 999}).json()["items"]) <= settings.max_results
     assert len(client.post("/v1/bootstrap", headers={"Authorization": "Bearer invalid"}, json={"agent_id": "zeus"}).content) < settings.max_bootstrap_bytes
@@ -245,7 +267,7 @@ def test_bootstrap_is_current_first_scoped_and_bounded_without_history(client, s
 def test_current_supersede_and_bounded_history_retain_old_event(client, store):
     token, _ = access(client, product="DAOS", topic="memory")
     headers = {"Authorization": f"Bearer {token}"}
-    old_id = store.events[0]["id"]
+    old_id = next(e["id"] for e in store.events if e["title"] == "Zeus current note")
     response = client.post(f"/v1/events/{old_id}/supersede", headers=headers, json={
         "product": "DAOS", "topic": "memory", "memory_type": "STRATEGY", "event_type": "STRATEGY",
         "title": "New direction", "summary": "New direction", "content": "Current plan", "source_interface": "chatgpt",
@@ -260,6 +282,45 @@ def test_current_supersede_and_bounded_history_retain_old_event(client, store):
     assert any(e["id"] == old_id and e["status"] == "SUPERSEDED" for e in history)
 
 
+@pytest.mark.parametrize("title", ["Owner chose API", "Verified benchmark", "Apollo current note"])
+def test_agent_cannot_supersede_protected_or_other_actor_current_event(client, store, title):
+    token, _ = access(client, product="DAOS", topic="memory")
+    old = next(e for e in store.events if e["title"] == title)
+    before = deepcopy(store.events)
+    response = client.post(
+        f"/v1/events/{old['id']}/supersede",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "product": "DAOS", "topic": "memory", "memory_type": "STRATEGY",
+            "event_type": "STRATEGY", "title": "Unauthorized replacement",
+            "summary": "Unauthorized replacement", "content": "must not persist",
+            "source_interface": "chatgpt", "authority_level": "AGENT_ASSESSMENT", "metadata": {},
+        },
+    )
+    assert response.status_code == 404
+    assert store.events == before
+    assert store.relations == []
+
+
+def test_agent_cannot_supersede_own_event_into_another_product_or_topic(client, store):
+    token, _ = access(client, product="DAOS", topic="memory")
+    old = next(e for e in store.events if e["title"] == "Zeus current note")
+    before = deepcopy(store.events)
+    response = client.post(
+        f"/v1/events/{old['id']}/supersede",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "product": "Other", "topic": "memory", "memory_type": "STRATEGY",
+            "event_type": "STRATEGY", "title": "Cross-product replacement",
+            "summary": "Cross-product replacement", "content": "must not persist",
+            "source_interface": "chatgpt", "authority_level": "AGENT_ASSESSMENT", "metadata": {},
+        },
+    )
+    assert response.status_code == 404
+    assert store.events == before
+    assert store.relations == []
+
+
 def test_writer_restrictions_and_owner_authority_protection(client):
     token, _ = access(client)
     headers = {"Authorization": f"Bearer {token}"}
@@ -272,6 +333,22 @@ def test_writer_restrictions_and_owner_authority_protection(client):
     allowed = client.post("/v1/events", headers=headers, json={**base, "memory_type": "ASSESSMENT", "authority_level": "AGENT_ASSESSMENT"})
     assert allowed.status_code == 201
     assert allowed.json()["actor"] == "zeus"
+
+
+def test_event_metadata_over_json_byte_cap_is_rejected(client):
+    token, _ = access(client)
+    response = client.post(
+        "/v1/events",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "product": "DAOS", "topic": "memory", "memory_type": "ASSESSMENT",
+            "event_type": "NOTE", "title": "bounded", "summary": "bounded",
+            "content": "bounded", "source_interface": "chatgpt",
+            "authority_level": "AGENT_ASSESSMENT", "metadata": {"value": "x" * 4096},
+        },
+    )
+    assert response.status_code == 422
+    assert "metadata must not exceed 4096 JSON bytes" in response.text
 
 
 def test_access_token_expires_and_is_revoked_with_agent(client, store):

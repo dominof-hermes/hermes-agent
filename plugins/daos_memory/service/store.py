@@ -130,13 +130,17 @@ class AsyncpgStore:
         pool = await self._get_pool()
         return await _insert_event(pool, event, self.timeout)
 
-    async def supersede_event(self, old_id: str, event: dict[str, Any]):
+    async def supersede_event(self, old_id: str, actor_id: str, event: dict[str, Any]):
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             async with conn.transaction():
                 old = await conn.fetchrow(
-                    "SELECT id FROM daos_memory.context_events WHERE id=$1::uuid AND status='CURRENT' FOR UPDATE",
-                    old_id, timeout=self.timeout,
+                    """SELECT id FROM daos_memory.context_events
+                    WHERE id=$1::uuid AND actor=$2 AND product=$3 AND topic=$4
+                      AND status='CURRENT'
+                      AND authority_level IN ('AGENT_ASSESSMENT','HYPOTHESIS','OPERATIONAL_STATE')
+                    FOR UPDATE""",
+                    old_id, actor_id, event["product"], event["topic"], timeout=self.timeout,
                 )
                 if not old:
                     return None

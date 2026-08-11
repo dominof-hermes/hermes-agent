@@ -351,6 +351,9 @@ plugins = [
   "**/plugin.yaml",
   "**/plugin.yml",
   "**/README.md",
+  "daos_memory/migrations/001_daos_memory_v01.sql",
+  "daos_memory/systemd/daos-memory.service",
+  "daos_memory/requirements.txt",
 ]
 
 [tool.setuptools.packages.find]

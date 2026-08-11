@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+MAX_METADATA_JSON_BYTES = 4096
 
 Authority = Literal[
     "OWNER_DECISION", "VERIFIED_EVIDENCE", "OPERATIONAL_STATE",
@@ -39,6 +43,17 @@ class EventWrite(BaseModel):
     work_id: str | None = Field(default=None, max_length=160)
     source_ref: str | None = Field(default=None, max_length=500)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata")
+    @classmethod
+    def metadata_is_bounded_json(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            encoded = json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("metadata must be JSON serializable") from exc
+        if len(encoded) > MAX_METADATA_JSON_BYTES:
+            raise ValueError(f"metadata must not exceed {MAX_METADATA_JSON_BYTES} JSON bytes")
+        return value
 
 
 class RotateRequest(BaseModel):

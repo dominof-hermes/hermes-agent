@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import tomllib
 
 import httpx
 from fastapi import FastAPI
@@ -83,4 +84,16 @@ def test_systemd_template_is_separate_bounded_and_hardened():
     assert "TimeoutStartSec=" in unit
     assert "EnvironmentFile=" in unit
     assert "NoNewPrivileges=true" in unit
+    assert "Environment=HERMES_CONFIG_PATH=/etc/daos-memory/config.yaml" in unit
     assert "hermes gateway" not in unit.lower()
+
+
+def test_wheel_package_data_declares_only_daos_runtime_artifacts():
+    pyproject = tomllib.loads((ROOT.parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
+    plugin_data = pyproject["tool"]["setuptools"]["package-data"]["plugins"]
+    for artifact in (
+        "daos_memory/migrations/001_daos_memory_v01.sql",
+        "daos_memory/systemd/daos-memory.service",
+        "daos_memory/requirements.txt",
+    ):
+        assert artifact in plugin_data
