@@ -1,0 +1,11 @@
+{
+  "name": "daos_memory",
+  "label": "Memory",
+  "description": "DAOS organizational current context, decisions, policies, history, and agent access",
+  "icon": "Brain",
+  "version": "0.1.0",
+  "tab": { "path": "/memory", "position": "after:kanban" },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}

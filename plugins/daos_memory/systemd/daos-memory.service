@@ -1,0 +1,35 @@
+[Unit]
+Description=DAOS Shared Memory / Context Service
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/opt/hermes-agent
+EnvironmentFile=/etc/daos-memory/daos-memory.env
+ExecStart=/opt/daos-memory/venv/bin/uvicorn plugins.daos_memory.service.main:app --host 127.0.0.1 --port 8791 --workers 1 --timeout-keep-alive 5 --limit-concurrency 64
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=20s
+MemoryMax=256M
+TasksMax=128
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
