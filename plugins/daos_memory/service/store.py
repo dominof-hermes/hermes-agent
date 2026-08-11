@@ -182,8 +182,10 @@ class AsyncpgStore:
         clauses = {
             "current": "status='CURRENT'",
             "decisions": "memory_type='DECISION'",
+            "policies": "(memory_type='POLICY' OR event_type='POLICY')",
             "agent_notes": "authority_level IN ('AGENT_ASSESSMENT','HYPOTHESIS')",
             "history": "status<>'CURRENT'",
+            "knowledge_vault": "memory_type IN ('RESEARCH','ARCHITECTURE_ASSESSMENT','DESIGN_PROPOSAL','EVIDENCE','TECHNICAL_RESULT','SESSION_SUMMARY')",
         }
         return await self._events(clauses.get(view, "status='CURRENT'"), product, topic, None, limit)
 

@@ -181,8 +181,10 @@ class FakeStore:
     async def admin_events(self, view, product, topic, limit):
         rows = self.events
         if view == "decisions": rows = [e for e in rows if e["memory_type"] == "DECISION"]
+        elif view == "policies": rows = [e for e in rows if e["memory_type"] == "POLICY" or e["event_type"] == "POLICY"]
         elif view == "agent_notes": rows = [e for e in rows if e["authority_level"] in {"AGENT_ASSESSMENT", "HYPOTHESIS"}]
         elif view == "history": rows = [e for e in rows if e["status"] != "CURRENT"]
+        elif view == "knowledge_vault": rows = [e for e in rows if e["memory_type"] in {"RESEARCH", "ARCHITECTURE_ASSESSMENT", "DESIGN_PROPOSAL", "EVIDENCE", "TECHNICAL_RESULT", "SESSION_SUMMARY"}]
         else: rows = [e for e in rows if e["status"] == "CURRENT"]
         return deepcopy(rows[:limit])
 
@@ -317,6 +319,25 @@ def test_read_event_requires_agent_token_and_returns_exact_event(client, store):
     assert client.get(
         f"/v1/events/{uuid4()}",
         headers={"Authorization": f"Bearer {token}"},
+    ).status_code == 404
+
+
+def test_owner_can_read_exact_event_without_mutation(client, store):
+    event = next(e for e in store.events if e["title"] == "Owner chose API")
+    before = deepcopy(store.events)
+
+    assert client.get(f"/v1/admin/events/{event['id']}").status_code == 401
+    response = client.get(
+        f"/v1/admin/events/{event['id']}",
+        headers={"Authorization": "Bearer owner-secret"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == event["id"]
+    assert store.events == before
+    assert client.get(
+        f"/v1/admin/events/{uuid4()}",
+        headers={"Authorization": "Bearer owner-secret"},
     ).status_code == 404
 
 

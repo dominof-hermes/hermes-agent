@@ -5,7 +5,8 @@
   if (!SDK || !registry) return;
   const React = SDK.React;
   const h = React.createElement;
-  const VIEWS = ["Current", "Decisions", "Policies", "Agent Notes", "History", "Agent Access"];
+  const VIEWS = ["Current", "Decisions", "Policies", "Agent Notes", "History", "Knowledge Vault", "Agent Access"];
+  const EVENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
   function api(path, options) {
     return SDK.fetchJSON("/api/plugins/daos_memory" + path, options);
@@ -13,6 +14,18 @@
 
   function ErrorBox(props) {
     return h("div", { className: "dm-error", role: "alert" }, props.message || "Memory service unavailable");
+  }
+
+  function eventPath(eventId) {
+    return "/memory/events/" + encodeURIComponent(eventId);
+  }
+
+  function eventIdFromPath(pathname) {
+    const match = String(pathname || "").match(/^\/memory\/events\/([^/]+)\/?$/);
+    if (!match) return null;
+    let eventId;
+    try { eventId = decodeURIComponent(match[1]); } catch (_) { return null; }
+    return EVENT_ID_PATTERN.test(eventId) ? eventId : null;
   }
 
   function createLatestRequestChannel() {
@@ -148,7 +161,11 @@
         h("h2", { id: "dm-event-detail-title" }, value(item.title, "Memory Event"))
       ), h("button", { ref: closeRef, onClick: onClose, "aria-label": "Close event detail" }, "Close")),
       h("dl", { className: "dm-detail-grid" },
-        field("Event ID", item.id, true, "mono"),
+        h("div", { className: "dm-detail-field wide mono" },
+          h("dt", null, "Event ID"), h("dd", null,
+            h("a", { href: eventPath(item.id) }, value(item.id))
+          )
+        ),
         field("Product", item.product), field("Topic", item.topic),
         field("Title", item.title, true),
         field("Summary", item.summary, true),
@@ -211,7 +228,8 @@
   }
 
   function MemoryPage() {
-    const [view, setView] = React.useState("Current");
+    const initialListState = window.history.state && window.history.state.dmMemoryList;
+    const [view, setView] = React.useState(initialListState && VIEWS.includes(initialListState.view) ? initialListState.view : "Current");
     const [data, setData] = React.useState({ items: [] });
     const [selectedEvent, setSelectedEvent] = React.useState(null);
     const [secret, setSecret] = React.useState(null);
@@ -219,18 +237,22 @@
     const [loading, setLoading] = React.useState(true);
     const [actionBusy, setActionBusy] = React.useState(false);
     const requestChannelRef = React.useRef(null);
+    const detailChannelRef = React.useRef(null);
     const actionChannelRef = React.useRef(null);
     const actionBusyRef = React.useRef(false);
     const returnFocusRef = React.useRef(null);
     const viewRef = React.useRef(view);
     if (!requestChannelRef.current) requestChannelRef.current = createLatestRequestChannel();
+    if (!detailChannelRef.current) detailChannelRef.current = createLatestRequestChannel();
     if (!actionChannelRef.current) actionChannelRef.current = createLatestRequestChannel();
     viewRef.current = view;
 
     function endpoint(selected) {
-      if (selected === "Policies") return "/policies";
       if (selected === "Agent Access") return "/agents";
-      const names = { "Current": "current", "Decisions": "decisions", "Agent Notes": "agent_notes", "History": "history" };
+      const names = {
+        "Current": "current", "Decisions": "decisions", "Policies": "policies",
+        "Agent Notes": "agent_notes", "History": "history", "Knowledge Vault": "knowledge_vault"
+      };
       return "/memory?view=" + names[selected] + "&limit=25";
     }
 
@@ -252,15 +274,78 @@
     }
 
     React.useEffect(function () {
-      setSecret(null); setSelectedEvent(null); load(view);
+      setSecret(null); load(view);
       return function () {
         requestChannelRef.current.invalidate();
       };
     }, [view]);
 
+    React.useEffect(function () {
+      function restoreListState(state) {
+        const listState = state && state.dmMemoryList;
+        if (listState && VIEWS.includes(listState.view) && listState.view !== viewRef.current) {
+          setView(listState.view);
+        }
+        const scrollY = listState && Number.isFinite(listState.scrollY) ? listState.scrollY : 0;
+        const schedule = window.requestAnimationFrame || function (callback) { return setTimeout(callback, 0); };
+        schedule(function () { window.scrollTo(0, scrollY); });
+      }
+      function loadDirectEvent(eventId) {
+        const request = detailChannelRef.current.start();
+        setError("");
+        api("/events/" + encodeURIComponent(eventId), { signal: request.signal }).then(function (item) {
+          if (!detailChannelRef.current.isCurrent(request.generation)) return;
+          setSelectedEvent(item);
+        }).catch(function (caught) {
+          if (!detailChannelRef.current.isCurrent(request.generation)) return;
+          if (caught && caught.name === "AbortError") return;
+          setSelectedEvent(null); setError("Memory event unavailable (fail closed).");
+        }).finally(function () {
+          if (detailChannelRef.current.isCurrent(request.generation)) detailChannelRef.current.finish(request.generation);
+        });
+      }
+      function handlePopState(event) {
+        const eventId = eventIdFromPath(window.location.pathname);
+        if (eventId) loadDirectEvent(eventId);
+        else {
+          detailChannelRef.current.invalidate();
+          setSelectedEvent(null);
+          restoreListState(event.state);
+        }
+      }
+      window.addEventListener("popstate", handlePopState);
+      const directEventId = eventIdFromPath(window.location.pathname);
+      if (directEventId) loadDirectEvent(directEventId);
+      return function () {
+        window.removeEventListener("popstate", handlePopState);
+        detailChannelRef.current.invalidate();
+      };
+    }, []);
+
     function openEvent(item, returnFocus) {
       returnFocusRef.current = returnFocus;
+      const listState = { view: view, scrollY: window.scrollY || 0 };
+      window.history.replaceState({ dmMemoryList: listState }, "", "/memory");
+      window.history.pushState({ dmMemoryDetail: true, dmMemoryList: listState }, "", eventPath(item.id));
       setSelectedEvent(item);
+    }
+
+    function closeEvent() {
+      if (eventIdFromPath(window.location.pathname) && window.history.state && window.history.state.dmMemoryDetail) {
+        window.history.back();
+        return;
+      }
+      detailChannelRef.current.invalidate();
+      window.history.replaceState({ dmMemoryList: { view: view, scrollY: window.scrollY || 0 } }, "", "/memory");
+      setSelectedEvent(null);
+    }
+
+    function selectView(name) {
+      detailChannelRef.current.invalidate();
+      setSelectedEvent(null);
+      window.history.replaceState({ dmMemoryList: { view: name, scrollY: 0 } }, "", "/memory");
+      setView(name);
+      window.scrollTo(0, 0);
     }
 
     function rotate(agent) {
@@ -313,7 +398,6 @@
 
     let body;
     if (loading) body = h("div", { className: "dm-empty" }, "Loading bounded view…");
-    else if (view === "Policies") body = h(PolicyTable, { items: data.items });
     else if (view === "Agent Access") body = h(AgentAccess, {
       items: data.items, secret: secret, busy: actionBusy, onRotate: rotate, onRevoke: revoke
     });
@@ -325,21 +409,23 @@
         h("p", null, "Effective context first. Stored time remains distinct from occurred time.")
       ), h("button", { onClick: function () { load(view); } }, "Refresh")),
       h("nav", { className: "dm-tabs", "aria-label": "Memory views" }, VIEWS.map(function (name) {
-        return h("button", { key: name, className: name === view ? "active" : "", onClick: function () { setView(name); } }, name);
+        return h("button", { key: name, className: name === view ? "active" : "", onClick: function () { selectView(name); } }, name);
       })),
       error && h(ErrorBox, { message: error }),
       body,
       selectedEvent && h(EventDetail, {
         item: selectedEvent,
         returnFocus: returnFocusRef.current,
-        onClose: function () { setSelectedEvent(null); }
+        onClose: closeEvent
       })
     );
   }
 
   window.__DAOS_MEMORY_INTERNALS__ = {
     createLatestRequestChannel: createLatestRequestChannel,
-    handleDialogKey: handleDialogKey
+    handleDialogKey: handleDialogKey,
+    eventPath: eventPath,
+    eventIdFromPath: eventIdFromPath
   };
   registry.register("daos_memory", MemoryPage);
 })();

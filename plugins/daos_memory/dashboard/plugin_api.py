@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import httpx
 import yaml
@@ -58,13 +59,17 @@ def create_router(*, service_url: str, owner_token: str, timeout_seconds: float,
 
     @router.get("/memory")
     async def memory(
-        view: str = Query(default="current", pattern="^(current|decisions|agent_notes|history)$"),
+        view: str = Query(default="current", pattern="^(current|decisions|policies|agent_notes|history|knowledge_vault)$"),
         product: str | None = Query(default=None, max_length=120),
         topic: str | None = Query(default=None, max_length=160),
         limit: int = Query(default=25, ge=1, le=50),
     ):
         params = {"view": view, "product": product, "topic": topic, "limit": limit}
         return await call("GET", "/v1/admin/events", params={key: value for key, value in params.items() if value is not None})
+
+    @router.get("/events/{event_id}")
+    async def event_detail(event_id: UUID):
+        return await call("GET", f"/v1/admin/events/{event_id}")
 
     @router.get("/policies")
     async def policies():

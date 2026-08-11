@@ -80,11 +80,29 @@ def test_memory_proxy_omits_unset_filters_and_preserves_explicit_values():
     ]
 
 
+def test_dashboard_event_detail_proxy_is_owner_authenticated_and_read_only():
+    event_id = "11111111-1111-4111-8111-111111111111"
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        assert request.method == "GET"
+        assert request.url.path == f"/v1/admin/events/{event_id}"
+        assert request.headers["authorization"] == "Bearer owner-secret"
+        return httpx.Response(200, json={"id": event_id, "title": "Direct event", "content": "Full content"})
+
+    response = proxy_client(handler).get(f"/events/{event_id}")
+
+    assert response.status_code == 200
+    assert response.json()["id"] == event_id
+    assert len(seen) == 1
+
+
 def test_dashboard_artifacts_define_top_level_memory_views():
     manifest = json.loads((ROOT / "dashboard" / "manifest.json").read_text())
     assert manifest["tab"]["path"] == "/memory"
     script = (ROOT / "dashboard" / "dist" / "index.js").read_text()
-    for view in ("Current", "Decisions", "Policies", "Agent Notes", "History", "Agent Access"):
+    for view in ("Current", "Decisions", "Policies", "Agent Notes", "History", "Knowledge Vault", "Agent Access"):
         assert view in script
     assert "owner-secret" not in script
 
@@ -116,6 +134,36 @@ def test_event_rows_open_one_shared_read_only_detail_drawer_with_full_content():
     assert "api(" not in detail_source
     assert "dm-drawer" in style
     assert "dm-detail-content" in style
+
+
+def test_event_detail_uses_direct_url_and_browser_history_without_mutation_controls():
+    source = (ROOT / "dashboard" / "dist" / "index.js").read_text()
+    program = f"""
+      global.window = {{
+        __HERMES_PLUGIN_SDK__: {{ React: {{}} }},
+        __HERMES_PLUGINS__: {{ register: function () {{}} }},
+        location: {{ pathname: "/memory/events/11111111-1111-4111-8111-111111111111" }}
+      }};
+      global.document = {{ activeElement: null }};
+      eval({json.dumps(source)});
+      const hooks = window.__DAOS_MEMORY_INTERNALS__;
+      const id = "11111111-1111-4111-8111-111111111111";
+      if (hooks.eventPath(id) !== "/memory/events/" + id) throw new Error("event path mismatch");
+      if (hooks.eventIdFromPath(window.location.pathname) !== id) throw new Error("deep link parse failed");
+      if (hooks.eventIdFromPath("/memory/events/not-a-uuid") !== null) throw new Error("invalid id accepted");
+      if (hooks.eventIdFromPath("/memory") !== null) throw new Error("list route parsed as detail");
+    """
+    result = subprocess.run(["node", "-e", program], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+    assert "history.pushState" in source
+    assert "history.replaceState" in source
+    assert 'addEventListener("popstate"' in source
+    assert 'removeEventListener("popstate"' in source
+    assert 'api("/events/" + encodeURIComponent(eventId)' in source
+    assert 'href: eventPath(item.id)' in source
+    assert "Edit" not in source
+    assert "Delete" not in source
 
 
 def test_dashboard_internal_coordinators_abort_stale_requests_and_trap_dialog_focus():

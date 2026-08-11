@@ -195,13 +195,20 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
 
     @app.get("/v1/admin/events", dependencies=[Depends(owner_auth)])
     async def admin_events(
-        view: str = Query(default="current", pattern="^(current|decisions|agent_notes|history)$"),
+        view: str = Query(default="current", pattern="^(current|decisions|policies|agent_notes|history|knowledge_vault)$"),
         product: str | None = Query(default=None, max_length=120),
         topic: str | None = Query(default=None, max_length=160),
         limit: int = Query(default=25, ge=1),
     ):
         rows = await bounded(store.admin_events(view, product, topic, min(limit, settings.max_results)))
         return {"items": rows, "count": len(rows)}
+
+    @app.get("/v1/admin/events/{event_id}", dependencies=[Depends(owner_auth)])
+    async def admin_event(event_id: UUID):
+        row = await bounded(store.read_event(str(event_id)))
+        if not row:
+            raise HTTPException(status_code=404, detail="event not found")
+        return row
 
     @app.get("/v1/admin/policies", dependencies=[Depends(owner_auth)])
     async def admin_policies():
