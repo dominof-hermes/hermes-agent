@@ -48,7 +48,10 @@
     }
     const first = focusableElements[0];
     const last = focusableElements[focusableElements.length - 1];
-    if (event.shiftKey && document.activeElement === first) {
+    if (!focusableElements.includes(document.activeElement)) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    } else if (event.shiftKey && document.activeElement === first) {
       event.preventDefault();
       last.focus();
     } else if (!event.shiftKey && document.activeElement === last) {

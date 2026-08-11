@@ -158,11 +158,24 @@ def test_dashboard_internal_coordinators_abort_stale_requests_and_trap_dialog_fo
         [firstFocus, lastFocus], function () {{ closed += 1; }}
       );
       if (document.activeElement !== lastFocus || prevented !== 2) throw new Error("reverse trap failed");
+      const outsideFocus = {{ focus: function () {{ document.activeElement = outsideFocus; }} }};
+      document.activeElement = outsideFocus;
+      hooks.handleDialogKey(
+        {{ key: "Tab", shiftKey: false, preventDefault: function () {{ prevented += 1; }} }},
+        [firstFocus, lastFocus], function () {{ closed += 1; }}
+      );
+      if (document.activeElement !== firstFocus || prevented !== 3) throw new Error("outside forward trap failed");
+      document.activeElement = outsideFocus;
+      hooks.handleDialogKey(
+        {{ key: "Tab", shiftKey: true, preventDefault: function () {{ prevented += 1; }} }},
+        [firstFocus, lastFocus], function () {{ closed += 1; }}
+      );
+      if (document.activeElement !== lastFocus || prevented !== 4) throw new Error("outside reverse trap failed");
       hooks.handleDialogKey(
         {{ key: "Escape", preventDefault: function () {{ prevented += 1; }} }},
         [firstFocus, lastFocus], function () {{ closed += 1; }}
       );
-      if (closed !== 1 || prevented !== 3) throw new Error("escape close failed");
+      if (closed !== 1 || prevented !== 5) throw new Error("escape close failed");
     """
     result = subprocess.run(["node", "-e", program], capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
