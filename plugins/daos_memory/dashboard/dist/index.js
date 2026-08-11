@@ -217,9 +217,11 @@
     const [error, setError] = React.useState("");
     const [loading, setLoading] = React.useState(true);
     const requestChannelRef = React.useRef(null);
+    const actionChannelRef = React.useRef(null);
     const returnFocusRef = React.useRef(null);
     const viewRef = React.useRef(view);
     if (!requestChannelRef.current) requestChannelRef.current = createLatestRequestChannel();
+    if (!actionChannelRef.current) actionChannelRef.current = createLatestRequestChannel();
     viewRef.current = view;
 
     function endpoint(selected) {
@@ -248,7 +250,10 @@
 
     React.useEffect(function () {
       setSecret(null); setSelectedEvent(null); load(view);
-      return function () { requestChannelRef.current.invalidate(); };
+      return function () {
+        requestChannelRef.current.invalidate();
+        actionChannelRef.current.invalidate();
+      };
     }, [view]);
 
     function openEvent(item, returnFocus) {
@@ -258,26 +263,40 @@
 
     function rotate(agent) {
       const actionView = view;
-      setError("");
-      api("/agents/" + encodeURIComponent(agent) + "/rotate", { method: "POST" })
-        .then(function (result) {
-          if (viewRef.current !== actionView) return;
-          setSecret(result); load(actionView);
-        })
-        .catch(function () {
-          if (viewRef.current !== actionView) return;
-          setSecret(null); setError("Rotation unavailable; no credential was issued.");
-        });
+      const action = actionChannelRef.current.start();
+      setSecret(null); setError("");
+      api("/agents/" + encodeURIComponent(agent) + "/rotate", {
+        method: "POST", signal: action.signal
+      }).then(function (result) {
+        if (!actionChannelRef.current.isCurrent(action.generation) || viewRef.current !== actionView) return;
+        setSecret(result); load(actionView);
+      }).catch(function (caught) {
+        if (!actionChannelRef.current.isCurrent(action.generation) || viewRef.current !== actionView) return;
+        if (caught && caught.name === "AbortError") return;
+        setSecret(null); setError("Rotation unavailable; no credential was issued.");
+      }).finally(function () {
+        if (!actionChannelRef.current.isCurrent(action.generation) || viewRef.current !== actionView) return;
+        actionChannelRef.current.finish(action.generation);
+      });
     }
 
     function revoke(agent) {
       const actionView = view;
+      const action = actionChannelRef.current.start();
       setSecret(null); setError("");
-      api("/agents/" + encodeURIComponent(agent) + "/revoke", { method: "POST" })
-        .then(function () { if (viewRef.current === actionView) load(actionView); })
-        .catch(function () {
-          if (viewRef.current === actionView) setError("Revocation could not be verified; access is treated as unavailable.");
-        });
+      api("/agents/" + encodeURIComponent(agent) + "/revoke", {
+        method: "POST", signal: action.signal
+      }).then(function () {
+        if (!actionChannelRef.current.isCurrent(action.generation) || viewRef.current !== actionView) return;
+        load(actionView);
+      }).catch(function (caught) {
+        if (!actionChannelRef.current.isCurrent(action.generation) || viewRef.current !== actionView) return;
+        if (caught && caught.name === "AbortError") return;
+        setError("Revocation could not be verified; access is treated as unavailable.");
+      }).finally(function () {
+        if (!actionChannelRef.current.isCurrent(action.generation) || viewRef.current !== actionView) return;
+        actionChannelRef.current.finish(action.generation);
+      });
     }
 
     let body;
