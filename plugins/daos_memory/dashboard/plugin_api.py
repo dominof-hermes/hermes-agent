@@ -63,7 +63,8 @@ def create_router(*, service_url: str, owner_token: str, timeout_seconds: float,
         topic: str | None = Query(default=None, max_length=160),
         limit: int = Query(default=25, ge=1, le=50),
     ):
-        return await call("GET", "/v1/admin/events", params={"view": view, "product": product, "topic": topic, "limit": limit})
+        params = {"view": view, "product": product, "topic": topic, "limit": limit}
+        return await call("GET", "/v1/admin/events", params={key: value for key, value in params.items() if value is not None})
 
     @router.get("/policies")
     async def policies():

@@ -57,6 +57,28 @@ def test_proxy_fails_closed_when_service_is_unavailable():
     assert "offline" not in response.text
 
 
+def test_memory_proxy_omits_unset_filters_and_preserves_explicit_values():
+    seen_queries = []
+
+    def handler(request):
+        seen_queries.append(dict(request.url.params))
+        return httpx.Response(200, json={"items": [], "count": 0})
+
+    client = proxy_client(handler)
+    default_response = client.get("/memory", params={"view": "current", "limit": 20})
+    filtered_response = client.get(
+        "/memory",
+        params={"view": "history", "product": "hermes", "topic": "release", "limit": 10},
+    )
+
+    assert default_response.status_code == 200
+    assert filtered_response.status_code == 200
+    assert seen_queries == [
+        {"view": "current", "limit": "20"},
+        {"view": "history", "product": "hermes", "topic": "release", "limit": "10"},
+    ]
+
+
 def test_dashboard_artifacts_define_top_level_memory_views():
     manifest = json.loads((ROOT / "dashboard" / "manifest.json").read_text())
     assert manifest["tab"]["path"] == "/memory"
