@@ -20,12 +20,14 @@ from uuid import UUID
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .service.models import MAX_METADATA_JSON_BYTES
 
 
 BASE_PATH = "/zeus-memory/v1"
+MAX_REQUEST_BODY_BYTES = 16 * 1024
 MAX_RESPONSE_BYTES = 90_000
 ACTION_PATHS = frozenset({
     f"{BASE_PATH}/bootstrap",
@@ -36,13 +38,17 @@ ACTION_PATHS = frozenset({
 })
 
 
-class BootstrapBody(BaseModel):
+class ActionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class BootstrapBody(ActionBody):
     bootstrap_key: str = Field(min_length=16, max_length=512)
     product: str | None = Field(default=None, max_length=120)
     topic: str | None = Field(default=None, max_length=160)
 
 
-class ContextBody(BaseModel):
+class ContextBody(ActionBody):
     context_id: str = Field(min_length=32, max_length=128)
 
 
@@ -245,6 +251,88 @@ class _ContextVault:
         return context.access_token
 
 
+class _ActionBoundaryMiddleware:
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        max_body_bytes: int,
+        tokens: tuple[str, ...],
+    ):
+        self.app = app
+        self.max_body_bytes = max_body_bytes
+        self.tokens = tokens
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path") not in ACTION_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        headers = {key.lower(): value for key, value in scope.get("headers", [])}
+        authorization = headers.get(b"authorization", b"").decode("latin-1")
+        if not _authorized(authorization, self.tokens):
+            await _error(401, "UNAUTHORIZED", "Bearer token required")(
+                scope, receive, send
+            )
+            return
+
+        if scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+
+        raw_length = headers.get(b"content-length")
+        if raw_length is not None:
+            try:
+                content_length = int(raw_length)
+            except ValueError:
+                await _error(400, "INVALID_REQUEST", "Request body length is invalid")(
+                    scope, receive, send
+                )
+                return
+            if content_length < 0:
+                await _error(400, "INVALID_REQUEST", "Request body length is invalid")(
+                    scope, receive, send
+                )
+                return
+            if content_length > self.max_body_bytes:
+                await _error(413, "REQUEST_TOO_LARGE", "Request body exceeds the allowed size")(
+                    scope, receive, send
+                )
+                return
+
+        chunks: list[bytes] = []
+        received = 0
+        more_body = True
+        while more_body:
+            message = await receive()
+            if message["type"] != "http.request":
+                await _error(400, "INVALID_REQUEST", "Request body is incomplete")(
+                    scope, receive, send
+                )
+                return
+            chunk = message.get("body", b"")
+            received += len(chunk)
+            if received > self.max_body_bytes:
+                await _error(413, "REQUEST_TOO_LARGE", "Request body exceeds the allowed size")(
+                    scope, receive, send
+                )
+                return
+            chunks.append(chunk)
+            more_body = bool(message.get("more_body", False))
+
+        body = b"".join(chunks)
+        replayed = False
+
+        async def bounded_receive() -> Message:
+            nonlocal replayed
+            if replayed:
+                return {"type": "http.disconnect"}
+            replayed = True
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        await self.app(scope, bounded_receive, send)
+
+
 def _error(status: int, code: str, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=status,
@@ -324,13 +412,11 @@ def build_asgi_app(
         redirect_slashes=False,
     )
 
-    @app.middleware("http")
-    async def authenticate_action_boundary(request: Request, call_next):
-        if request.url.path in ACTION_PATHS and not _authorized(
-            request.headers.get("authorization"), token_set
-        ):
-            return _error(401, "UNAUTHORIZED", "Bearer token required")
-        return await call_next(request)
+    app.add_middleware(
+        _ActionBoundaryMiddleware,
+        max_body_bytes=MAX_REQUEST_BODY_BYTES,
+        tokens=token_set,
+    )
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(_request: Request, _exc: RequestValidationError):

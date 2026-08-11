@@ -143,6 +143,71 @@ def test_context_handle_drives_current_history_write_and_exact_event_read():
     assert "access_token" not in "".join(r.text for r in (current, history, written, event))
 
 
+def test_action_request_body_is_bounded_before_validation_and_rejects_extra_fields():
+    client = TestClient(
+        action_api.build_asgi_app(
+            upstream=FakeUpstream(), tokens=(ACTION_TOKEN,), clock=lambda: NOW
+        )
+    )
+    oversized = client.post(
+        "/zeus-memory/v1/current",
+        headers=HEADERS,
+        json={"context_id": "x" * 43, "padding": "z" * 20_000},
+    )
+    assert oversized.status_code == 413
+    assert oversized.json()["error"]["code"] == "REQUEST_TOO_LARGE"
+    assert "padding" not in oversized.text
+
+    small_extra = client.post(
+        "/zeus-memory/v1/bootstrap",
+        headers=HEADERS,
+        json={"bootstrap_key": "one-time-bootstrap", "padding": "not-allowed"},
+    )
+    assert small_extra.status_code == 400
+    assert "not-allowed" not in small_extra.text
+
+
+def test_action_chunked_body_without_content_length_is_bounded():
+    app = action_api.build_asgi_app(
+        upstream=FakeUpstream(), tokens=(ACTION_TOKEN,), clock=lambda: NOW
+    )
+    payload = json.dumps(
+        {"context_id": "x" * 43, "padding": "z" * 20_000}
+    ).encode()
+    messages = [
+        {"type": "http.request", "body": payload[:8_000], "more_body": True},
+        {"type": "http.request", "body": payload[8_000:], "more_body": False},
+    ]
+    sent = []
+
+    async def receive():
+        return messages.pop(0)
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": "/zeus-memory/v1/current",
+        "raw_path": b"/zeus-memory/v1/current",
+        "query_string": b"",
+        "headers": [(b"authorization", f"Bearer {ACTION_TOKEN}".encode()), (b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 1),
+        "server": ("testserver", 443),
+        "root_path": "",
+    }
+    asyncio.run(app(scope, receive, send))
+    status = next(message["status"] for message in sent if message["type"] == "http.response.start")
+    body = b"".join(message.get("body", b"") for message in sent if message["type"] == "http.response.body")
+    assert status == 413
+    assert json.loads(body)["error"]["code"] == "REQUEST_TOO_LARGE"
+    assert b"padding" not in body
+
+
 def test_action_routes_fail_closed_and_validation_never_echoes_credentials():
     client = TestClient(
         action_api.build_asgi_app(
