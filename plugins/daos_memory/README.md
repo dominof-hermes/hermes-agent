@@ -12,6 +12,10 @@ not add a Hermes core/model tool and never runs inside the Hermes Gateway.
 - `migrations/001_daos_memory_v01.sql`: `daos_memory` schema and four core tables.
 - `dashboard/`: dashboard-authenticated proxy and top-level `/memory` UI.
 - `systemd/daos-memory.service`: bounded/hardened service template.
+- `systemd/gateway_health.py` + `daos-gateway-health.service`: private,
+  bridge-scoped host Gateway liveness bridge for a containerized Dashboard. It
+  validates the host Gateway PID/command and exposes only bounded `/health` and
+  `/health/detailed` data; it does not proxy Gateway sessions or credentials.
 
 ## Configure
 

@@ -1,0 +1,37 @@
+[Unit]
+Description=DAOS private Hermes Gateway health bridge
+After=network-online.target docker.service hermes-gateway.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/daos-memory/current
+ExecStartPre=+/bin/sh -c '/usr/sbin/iptables -C INPUT -i br-a0bd2b780836 -s 172.18.0.0/16 -d 172.18.0.1 -p tcp --dport 8792 -j ACCEPT 2>/dev/null || /usr/sbin/iptables -I INPUT 5 -i br-a0bd2b780836 -s 172.18.0.0/16 -d 172.18.0.1 -p tcp --dport 8792 -j ACCEPT'
+ExecStart=/opt/daos-memory/current/venv/bin/python /opt/daos-memory/current/plugins/daos_memory/systemd/gateway_health.py --host 172.18.0.1 --port 8792
+ExecStopPost=+/bin/sh -c '/usr/sbin/iptables -C INPUT -i br-a0bd2b780836 -s 172.18.0.0/16 -d 172.18.0.1 -p tcp --dport 8792 -j ACCEPT 2>/dev/null && /usr/sbin/iptables -D INPUT -i br-a0bd2b780836 -s 172.18.0.0/16 -d 172.18.0.1 -p tcp --dport 8792 -j ACCEPT || true'
+Restart=always
+RestartSec=3s
+TimeoutStartSec=20s
+TimeoutStopSec=10s
+MemoryMax=64M
+TasksMax=32
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
