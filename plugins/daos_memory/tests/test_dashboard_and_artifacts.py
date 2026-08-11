@@ -137,7 +137,7 @@ def test_zeus_action_nginx_locations_are_exact_host_gated_and_bounded():
         "/zeus-memory/v1/event",
     ):
         assert f"location = {path}" in config
-    assert 'if ($host != "ax.dominof.com") { return 404; }' in config
+    assert 'if ($host !~ "^(ax[.]dominof[.]com|memory[.]dominof[.]com)$") { return 404; }' in config
     assert config.count("if ($request_method != POST) { return 405; }") == 5
     assert "location ^~ /zeus-memory/" in config
     assert "location ~* ^/zeus-memory" in config
@@ -145,6 +145,19 @@ def test_zeus_action_nginx_locations_are_exact_host_gated_and_bounded():
     assert "proxy_pass http://172.18.0.1:8793" in config
     assert "proxy_read_timeout 40s" in config
     assert "Authorization" not in config
+
+
+def test_memory_domain_vhost_is_dedicated_tls_only_and_fail_closed():
+    config = (ROOT / "nginx" / "memory_dominof_vhost.conf").read_text()
+    assert config.count("server_name memory.dominof.com;") == 2
+    assert "listen 80;" in config
+    assert "return 301 https://$host$request_uri;" in config
+    assert "listen 443 ssl;" in config
+    assert "ssl_certificate /etc/letsencrypt/live/npm-memory/fullchain.pem;" in config
+    assert "ssl_certificate_key /etc/letsencrypt/live/npm-memory/privkey.pem;" in config
+    assert "include /data/nginx/custom/zeus_memory_locations_memory[.]conf;" in config
+    assert "location / { return 404; }" in config
+    assert "server_proxy" not in config
 
 
 def test_wheel_package_data_declares_only_daos_runtime_artifacts():
@@ -156,6 +169,7 @@ def test_wheel_package_data_declares_only_daos_runtime_artifacts():
         "daos_memory/systemd/daos-zeus-memory-action.service",
         "daos_memory/openapi/zeus_memory_action.yaml",
         "daos_memory/nginx/zeus_memory_locations.conf",
+        "daos_memory/nginx/memory_dominof_vhost.conf",
         "daos_memory/requirements.txt",
     ):
         assert artifact in plugin_data

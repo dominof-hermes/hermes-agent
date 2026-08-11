@@ -271,7 +271,7 @@ def test_openapi_declares_exactly_five_zeus_memory_tools():
     document = yaml.safe_load(schema_path.read_text(encoding="utf-8"))
 
     assert document["openapi"] == "3.1.0"
-    assert document["servers"] == [{"url": "https://ax.dominof.com"}]
+    assert document["servers"] == [{"url": "https://memory.dominof.com"}]
     assert set(document["paths"]) == {
         "/zeus-memory/v1/bootstrap",
         "/zeus-memory/v1/current",

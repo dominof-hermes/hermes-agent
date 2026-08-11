@@ -7,7 +7,7 @@ info:
     one-time Bootstrap Key, retain the returned context_id inside the conversation,
     and pass that context_id to all later operations. Never repeat or expose keys.
 servers:
-  - url: https://ax.dominof.com
+  - url: https://memory.dominof.com
 security:
   - BearerAuth: []
 paths:
