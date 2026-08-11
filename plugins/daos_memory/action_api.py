@@ -20,7 +20,7 @@ from uuid import UUID
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .service.models import MAX_METADATA_JSON_BYTES
@@ -74,7 +74,21 @@ class WriteBody(ContextBody):
     thread_id: str | None = Field(default=None, max_length=160)
     work_id: str | None = Field(default=None, max_length=160)
     source_ref: str | None = Field(default=None, max_length=500)
+    occurred_at: AwareDatetime | None = None
+    effective_from: AwareDatetime | None = None
+    effective_to: AwareDatetime | None = None
+    source_session_at: AwareDatetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def effective_window_is_ordered(self):
+        if self.effective_to is not None:
+            start = self.effective_from or self.occurred_at
+            if start is None:
+                raise ValueError("effective_to requires effective_from or occurred_at")
+            if self.effective_to < start:
+                raise ValueError("effective_to must not precede effective_from or occurred_at")
+        return self
 
     @field_validator("metadata")
     @classmethod
@@ -507,7 +521,7 @@ def build_asgi_app(
         access_token, failure = context_token(authorization, body.context_id)
         if failure:
             return failure
-        event = body.model_dump(exclude={"context_id"})
+        event = body.model_dump(mode="json", exclude={"context_id"}, exclude_none=True)
         event["source_interface"] = "chatgpt_zeus_action"
         try:
             return _bounded(await upstream.write_event(access_token, event))

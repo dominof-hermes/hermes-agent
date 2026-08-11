@@ -97,12 +97,16 @@ def test_event_rows_open_one_shared_read_only_detail_drawer_with_full_content():
     for label in (
         "Event ID", "Product", "Topic", "Title", "Summary", "Full Content",
         "Memory Type", "Event Type", "Status", "Authority Level", "Actor",
-        "Actor Role", "Source Interface", "Source Ref", "Created At", "Updated At",
+        "Actor Role", "Source Interface", "Source Ref", "Stored At", "Occurred At",
+        "Effective From", "Effective To", "Source Session At", "Updated At",
         "Supersedes", "Related Event",
     ):
         assert label in detail_source
     assert "item.content" not in table_source
     assert "item.content" in detail_source
+    assert "item.occurred_at" in detail_source
+    assert "item.effective_from" in detail_source
+    assert "item.source_session_at" in detail_source
     assert "onClick" in table_source
     assert "onKeyDown" in table_source
     assert 'role: "button"' in table_source
@@ -121,6 +125,21 @@ def test_migration_has_only_required_core_tables_and_hashed_credential_columns()
     assert "access_token_hash" in sql
     assert "bootstrap_key text" not in sql
     assert "access_token text" not in sql
+    assert "delete from" not in sql
+
+
+def test_temporal_validity_migration_is_additive_backfilled_and_fail_safe():
+    sql = (ROOT / "migrations" / "002_event_temporal_validity.sql").read_text().lower()
+    for column in ("occurred_at", "effective_from", "effective_to", "source_session_at"):
+        assert f"add column if not exists {column}" in sql
+    assert "update daos_memory.context_events" in sql
+    assert "occurred_at = created_at" in sql
+    assert "effective_from = created_at" in sql
+    assert "source_session_at = created_at" in sql
+    assert "set not null" in sql
+    assert "history" in sql and "closed" in sql
+    assert "effective_to is null or effective_to >= effective_from" in sql
+    assert "drop table" not in sql
     assert "delete from" not in sql
 
 
@@ -203,6 +222,7 @@ def test_wheel_package_data_declares_only_daos_runtime_artifacts():
     plugin_data = pyproject["tool"]["setuptools"]["package-data"]["plugins"]
     for artifact in (
         "daos_memory/migrations/001_daos_memory_v01.sql",
+        "daos_memory/migrations/002_event_temporal_validity.sql",
         "daos_memory/systemd/daos-memory.service",
         "daos_memory/systemd/daos-zeus-memory-action.service",
         "daos_memory/openapi/zeus_memory_action.yaml",

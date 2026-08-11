@@ -10,6 +10,8 @@ not add a Hermes core/model tool and never runs inside the Hermes Gateway.
 - `service/main.py`: uvicorn entrypoint; fixed `/v1` API, bearer-header auth.
 - `service/store.py`: asyncpg pool with command/query timeouts and hard limits.
 - `migrations/001_daos_memory_v01.sql`: `daos_memory` schema and four core tables.
+- `migrations/002_event_temporal_validity.sql`: additive occurred/effective/source-session
+  timestamps, fail-safe history statuses, and effective-current ordering index.
 - `dashboard/`: dashboard-authenticated proxy and top-level `/memory` UI.
 - `systemd/daos-memory.service`: bounded/hardened service template.
 - `systemd/gateway_health.py` + `daos-gateway-health.service`: private,
@@ -61,7 +63,7 @@ in a URL, command argument, `config.yaml`, or logs.
 ## Install/run (operator steps; not applied by this change)
 
 1. Create a dedicated virtualenv and install `requirements.txt`.
-2. Review and apply `migrations/001_daos_memory_v01.sql` with a migration role.
+2. Review and apply every `migrations/*.sql` file in lexical order with a migration role.
 3. Install the reviewed unit template, environment file, and service user.
 4. Start `daos-memory.service`, then verify `GET /health` returns database `ok`.
 5. Enable/reload the bundled dashboard plugin and open `/memory`.

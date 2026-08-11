@@ -66,7 +66,7 @@ paths:
     post:
       operationId: memory_write
       summary: Write one Zeus event to Shared Memory
-      description: Zeus may write only its registry-authorized memory types and non-protected authority levels. The server fixes source_interface to chatgpt_zeus_action.
+      description: Zeus may write only its registry-authorized memory types and non-protected authority levels. The server fixes source_interface to chatgpt_zeus_action. Optional temporal fields are only for prior-session imports; supplying any of them stores the event as HISTORY and never promotes it to CURRENT.
       x-openai-isConsequential: true
       requestBody:
         required: true
@@ -217,6 +217,18 @@ components:
           oneOf: [{type: string, maxLength: 160}, {type: 'null'}]
         source_ref:
           oneOf: [{type: string, maxLength: 500}, {type: 'null'}]
+        occurred_at:
+          description: Actual time of the imported conversation, event, judgment, or decision. Supplying a temporal field marks this write as HISTORY.
+          oneOf: [{type: string, format: date-time}, {type: 'null'}]
+        effective_from:
+          description: Time from which the imported context was effective.
+          oneOf: [{type: string, format: date-time}, {type: 'null'}]
+        effective_to:
+          description: Time at which the imported context stopped being effective.
+          oneOf: [{type: string, format: date-time}, {type: 'null'}]
+        source_session_at:
+          description: Canonical timestamp of the original chat or session.
+          oneOf: [{type: string, format: date-time}, {type: 'null'}]
         metadata: {type: object, additionalProperties: true, default: {}}
     EventRequest:
       type: object
@@ -234,6 +246,12 @@ components:
         source_ref:
           oneOf: [{type: string}, {type: 'null'}]
         status: {type: string}
+        created_at: {type: string, format: date-time}
+        occurred_at: {type: string, format: date-time}
+        effective_from: {type: string, format: date-time}
+        effective_to:
+          oneOf: [{type: string, format: date-time}, {type: 'null'}]
+        source_session_at: {type: string, format: date-time}
     EventList:
       type: object
       additionalProperties: false

@@ -155,8 +155,11 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
     @app.post("/v1/events/{event_id}/supersede")
     async def supersede(event_id: UUID, body: EventWrite, agent: dict[str, Any] = Depends(agent_auth)):
         _authorize_write(agent, body)
+        event = _agent_event(agent, body)
+        if event["status"] != "CURRENT":
+            raise HTTPException(status_code=409, detail="historical imports cannot supersede current events")
         row = await bounded(store.supersede_event(
-            str(event_id), agent["agent_id"], _agent_event(agent, body),
+            str(event_id), agent["agent_id"], event,
         ))
         if not row:
             raise HTTPException(status_code=404, detail="current event not found")
@@ -216,14 +219,21 @@ def _authorize_write(agent: dict[str, Any], body: EventWrite) -> None:
 
 
 def _agent_event(agent: dict[str, Any], body: EventWrite) -> dict[str, Any]:
+    values = body.model_dump()
+    temporal_fields = ("occurred_at", "effective_from", "effective_to", "source_session_at")
+    historical_import = any(values.get(field) is not None for field in temporal_fields)
     return {
-        **body.model_dump(), "actor": agent["agent_id"], "actor_role": agent["agent_id"].upper(),
-        "status": "CURRENT", "supersedes_id": None,
+        **values, "actor": agent["agent_id"], "actor_role": agent["agent_id"].upper(),
+        "status": "HISTORY" if historical_import else "CURRENT", "supersedes_id": None,
     }
 
 
 def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
-    keys = ("id", "created_at", "product", "topic", "memory_type", "event_type", "title", "summary", "status", "authority_level", "actor", "work_id", "source_ref")
+    keys = (
+        "id", "created_at", "occurred_at", "effective_from", "effective_to",
+        "source_session_at", "product", "topic", "memory_type", "event_type",
+        "title", "summary", "status", "authority_level", "actor", "work_id", "source_ref",
+    )
     compact = {key: event.get(key) for key in keys}
     compact["summary"] = str(compact.get("summary") or "")[:400]
     return compact

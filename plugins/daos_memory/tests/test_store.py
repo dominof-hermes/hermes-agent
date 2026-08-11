@@ -56,22 +56,26 @@ class RecordingConnection:
         return {
             "id": event_id,
             "created_at": datetime.now(timezone.utc),
-            "actor": args[1],
-            "actor_role": args[2],
-            "source_interface": args[3],
-            "product": args[4],
-            "topic": args[5],
-            "thread_id": args[6],
-            "work_id": args[7],
-            "memory_type": args[8],
-            "event_type": args[9],
-            "title": args[10],
-            "summary": args[11],
-            "content": args[12],
-            "status": args[13],
-            "authority_level": args[14],
-            "source_ref": args[15],
-            "supersedes_id": args[16],
+            "occurred_at": args[1] or datetime.now(timezone.utc),
+            "effective_from": args[2] or args[1] or datetime.now(timezone.utc),
+            "effective_to": args[3],
+            "source_session_at": args[4] or args[1] or datetime.now(timezone.utc),
+            "actor": args[5],
+            "actor_role": args[6],
+            "source_interface": args[7],
+            "product": args[8],
+            "topic": args[9],
+            "thread_id": args[10],
+            "work_id": args[11],
+            "memory_type": args[12],
+            "event_type": args[13],
+            "title": args[14],
+            "summary": args[15],
+            "content": args[16],
+            "status": args[17],
+            "authority_level": args[18],
+            "source_ref": args[19],
+            "supersedes_id": args[20],
             "metadata": {},
         }
 
@@ -89,6 +93,15 @@ class RecordingPool:
 
     def acquire(self):
         return _Acquire(self.connection)
+
+
+class QueryRecordingPool:
+    def __init__(self):
+        self.calls = []
+
+    async def fetch(self, sql, *args, **kwargs):
+        self.calls.append((sql, args, kwargs))
+        return []
 
 
 def _event():
@@ -111,6 +124,24 @@ def _event():
         "supersedes_id": None,
         "metadata": {},
     }
+
+
+def test_event_queries_rank_authority_then_status_then_effective_occurrence():
+    pool = QueryRecordingPool()
+    store = AsyncpgStore("postgresql://ignored")
+    store._pool = pool
+
+    assert asyncio.run(store.read_current("DAOS", "memory", 25)) == []
+
+    sql, args, _ = pool.calls[0]
+    assert "occurred_at" in sql and "effective_from" in sql and "source_session_at" in sql
+    authority_pos = sql.index("CASE authority_level")
+    status_pos = sql.index("CASE status")
+    effective_pos = sql.index("COALESCE(effective_from, occurred_at, created_at) DESC")
+    occurred_pos = sql.index("occurred_at DESC")
+    stored_pos = sql.index("created_at DESC")
+    assert authority_pos < status_pos < effective_pos < occurred_pos < stored_pos
+    assert args == ("DAOS", "memory", None, 25)
 
 
 def test_supersede_eligibility_is_locked_by_actor_authority_and_topic_before_mutation():

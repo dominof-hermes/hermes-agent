@@ -143,6 +143,44 @@ def test_context_handle_drives_current_history_write_and_exact_event_read():
     assert "access_token" not in "".join(r.text for r in (current, history, written, event))
 
 
+def test_action_write_forwards_timezone_aware_history_import_times_only():
+    upstream = FakeUpstream()
+    client = TestClient(action_api.build_asgi_app(
+        upstream=upstream, tokens=(ACTION_TOKEN,), clock=lambda: NOW,
+    ))
+    context_id = client.post(
+        "/zeus-memory/v1/bootstrap", headers=HEADERS,
+        json={"bootstrap_key": "one-time-bootstrap"},
+    ).json()["context_id"]
+    base = {
+        "context_id": context_id, "product": "DAOS", "topic": "memory",
+        "memory_type": "SESSION_SUMMARY", "event_type": "HISTORY_IMPORT",
+        "title": "June session", "summary": "Imported later", "content": "Historical content",
+        "authority_level": "AGENT_ASSESSMENT",
+    }
+    occurred = "2026-06-18T09:00:00+00:00"
+
+    accepted = client.post("/zeus-memory/v1/events", headers=HEADERS, json={
+        **base, "occurred_at": occurred, "effective_from": occurred,
+        "effective_to": "2026-06-19T09:00:00+00:00", "source_session_at": occurred,
+    })
+    rejected = client.post("/zeus-memory/v1/events", headers=HEADERS, json={
+        **base, "occurred_at": "2026-06-18T09:00:00",
+    })
+    missing_start = client.post("/zeus-memory/v1/events", headers=HEADERS, json={
+        **base, "effective_to": "2026-06-19T09:00:00+00:00",
+    })
+
+    assert accepted.status_code == 200
+    assert rejected.status_code == missing_start.status_code == 400
+    write_call = next(call for call in upstream.calls if call[0] == "write_event")
+    forwarded = write_call[2]
+    for field in ("occurred_at", "effective_from", "effective_to", "source_session_at"):
+        parsed = datetime.fromisoformat(forwarded[field].replace("Z", "+00:00"))
+        assert parsed.tzinfo is not None
+    assert forwarded["source_interface"] == "chatgpt_zeus_action"
+
+
 def test_action_request_body_is_bounded_before_validation_and_rejects_extra_fields():
     client = TestClient(
         action_api.build_asgi_app(
@@ -289,6 +327,14 @@ def test_openapi_declares_exactly_five_zeus_memory_tools():
         "memory_read_event",
     }
     assert all(set(item) == {"post"} for item in document["paths"].values())
+    write_properties = document["components"]["schemas"]["WriteRequest"]["properties"]
+    for field in ("occurred_at", "effective_from", "effective_to", "source_session_at"):
+        assert field in write_properties
+        serialized = json.dumps(write_properties[field])
+        assert "date-time" in serialized and "null" in serialized
+        assert field not in document["components"]["schemas"]["WriteRequest"]["required"]
+    write_description = document["paths"]["/zeus-memory/v1/events"]["post"]["description"]
+    assert "HISTORY" in write_description and "CURRENT" in write_description
     assert document["security"] == [{"BearerAuth": []}]
     auth = document["components"]["securitySchemes"]["BearerAuth"]
     assert auth == {"type": "apiKey", "in": "header", "name": "Authorization"}

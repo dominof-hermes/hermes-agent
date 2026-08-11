@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, Field, field_validator, model_validator
 
 
 MAX_METADATA_JSON_BYTES = 4096
@@ -42,7 +42,21 @@ class EventWrite(BaseModel):
     thread_id: str | None = Field(default=None, max_length=160)
     work_id: str | None = Field(default=None, max_length=160)
     source_ref: str | None = Field(default=None, max_length=500)
+    occurred_at: AwareDatetime | None = None
+    effective_from: AwareDatetime | None = None
+    effective_to: AwareDatetime | None = None
+    source_session_at: AwareDatetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def effective_window_is_ordered(self):
+        if self.effective_to is not None:
+            start = self.effective_from or self.occurred_at
+            if start is None:
+                raise ValueError("effective_to requires effective_from or occurred_at")
+            if self.effective_to < start:
+                raise ValueError("effective_to must not precede effective_from or occurred_at")
+        return self
 
     @field_validator("metadata")
     @classmethod

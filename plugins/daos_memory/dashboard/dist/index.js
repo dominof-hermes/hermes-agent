@@ -22,7 +22,7 @@
     return h("div", { className: "dm-table-wrap" }, h("table", { className: "dm-table" },
       h("thead", null, h("tr", null,
         h("th", null, "Topic / Product"), h("th", null, "Summary"), h("th", null, "Type / Authority"),
-        h("th", null, "Status"), h("th", null, "Updated"), h("th", null, "Actor")
+        h("th", null, "Status"), h("th", null, "Effective / Occurred"), h("th", null, "Actor")
       )),
       h("tbody", null, items.map(function (item) {
         function openDetail() { onSelect(item); }
@@ -44,7 +44,10 @@
           h("td", null, h("strong", null, item.title), h("p", null, item.summary)),
           h("td", null, item.memory_type + " · " + item.authority_level),
           h("td", null, h("span", { className: "dm-status" }, item.status)),
-          h("td", null, item.created_at ? new Date(item.created_at).toLocaleString() : "—"),
+          h("td", null,
+            h("strong", null, item.effective_from ? new Date(item.effective_from).toLocaleString() : "—"),
+            h("small", null, "Occurred " + (item.occurred_at ? new Date(item.occurred_at).toLocaleString() : "—"))
+          ),
           h("td", null, item.actor)
         );
       }))
@@ -100,7 +103,11 @@
         field("Status", item.status), field("Authority Level", item.authority_level),
         field("Actor", item.actor), field("Actor Role", item.actor_role),
         field("Source Interface", item.source_interface), field("Source Ref", item.source_ref, true),
-        field("Created At", date(item.created_at)),
+        field("Occurred At", date(item.occurred_at)),
+        field("Stored At", date(item.created_at)),
+        field("Effective From", date(item.effective_from)),
+        field("Effective To", date(item.effective_to)),
+        field("Source Session At", date(item.source_session_at)),
         field("Updated At", date(item.updated_at, "— (immutable event)")),
         field("Supersedes", item.supersedes_id, true, "mono"),
         field("Related Event", item.related_event_id || item.related_event, true, "mono")
@@ -193,7 +200,7 @@
     return h("main", { className: "dm-page" },
       h("header", { className: "dm-header" }, h("div", null,
         h("span", { className: "dm-kicker" }, "DAOS ORGANIZATIONAL MEMORY"), h("h1", null, "Memory"),
-        h("p", null, "Current first. History on demand. Authority remains explicit.")
+        h("p", null, "Effective context first. Stored time remains distinct from occurred time.")
       ), h("button", { onClick: function () { load(view); } }, "Refresh")),
       h("nav", { className: "dm-tabs", "aria-label": "Memory views" }, VIEWS.map(function (name) {
         return h("button", { key: name, className: name === view ? "active" : "", onClick: function () { setView(name); } }, name);

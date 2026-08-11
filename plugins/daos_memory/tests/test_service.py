@@ -66,7 +66,9 @@ class FakeStore:
     @staticmethod
     def _event(product, topic, memory_type, summary, status, authority_level, actor):
         return {
-            "id": str(uuid4()), "created_at": NOW, "actor": actor, "actor_role": actor.upper(),
+            "id": str(uuid4()), "created_at": NOW, "occurred_at": NOW,
+            "effective_from": NOW, "effective_to": None, "source_session_at": NOW,
+            "actor": actor, "actor_role": actor.upper(),
             "source_interface": "test", "product": product, "topic": topic, "thread_id": None,
             "work_id": None, "memory_type": memory_type, "event_type": memory_type,
             "title": summary, "summary": summary, "content": summary, "status": status,
@@ -144,7 +146,16 @@ class FakeStore:
         return deepcopy(rows[:limit])
 
     async def write_event(self, event):
-        row = {**event, "id": str(uuid4()), "created_at": NOW}
+        occurred_at = event.get("occurred_at") or NOW
+        row = {
+            **event,
+            "id": str(uuid4()),
+            "created_at": NOW,
+            "occurred_at": occurred_at,
+            "effective_from": event.get("effective_from") or occurred_at,
+            "effective_to": event.get("effective_to"),
+            "source_session_at": event.get("source_session_at") or occurred_at,
+        }
         self.events.append(row)
         return deepcopy(row)
 
@@ -262,6 +273,10 @@ def test_bootstrap_is_current_first_scoped_and_bounded_without_history(client, s
     assert all(e["product"] == "DAOS" and e["topic"] == "memory" for e in payload["current_context"])
     assert {e["title"] for e in payload["owner_decisions"]} == {"Owner chose API"}
     assert all("source_ref" in e for key in ("current_context", "owner_decisions", "next_actions") for e in payload[key])
+    assert all(
+        {"created_at", "occurred_at", "effective_from", "effective_to", "source_session_at"} <= set(e)
+        for key in ("current_context", "owner_decisions", "next_actions") for e in payload[key]
+    )
     assert "Owner follow-up" in {e["title"] for e in payload["next_actions"]}
     assert "Owner follow-up" not in {e["title"] for e in payload["owner_decisions"]}
     assert "Do not include" not in repr(payload)
@@ -356,6 +371,58 @@ def test_writer_restrictions_and_owner_authority_protection(client):
     allowed = client.post("/v1/events", headers=headers, json={**base, "memory_type": "ASSESSMENT", "authority_level": "AGENT_ASSESSMENT"})
     assert allowed.status_code == 201
     assert allowed.json()["actor"] == "zeus"
+
+
+def test_explicit_session_time_is_stored_as_history_and_excluded_from_bootstrap(client):
+    token, _ = access(client, product="DAOS", topic="memory")
+    occurred = "2026-06-18T09:00:00+00:00"
+    response = client.post("/v1/events", headers={"Authorization": f"Bearer {token}"}, json={
+        "product": "DAOS", "topic": "memory", "memory_type": "SESSION_SUMMARY",
+        "event_type": "HISTORY_IMPORT", "title": "June imported session",
+        "summary": "Historical conversation imported in August", "content": "Historical content",
+        "source_interface": "chatgpt", "authority_level": "AGENT_ASSESSMENT",
+        "occurred_at": occurred, "source_session_at": occurred,
+        "effective_from": occurred, "effective_to": "2026-06-19T09:00:00+00:00",
+        "metadata": {},
+    })
+
+    assert response.status_code == 201
+    imported = response.json()
+    assert imported["created_at"] == NOW.isoformat()
+    assert datetime.fromisoformat(imported["occurred_at"].replace("Z", "+00:00")) == datetime.fromisoformat(occurred)
+    assert datetime.fromisoformat(imported["source_session_at"].replace("Z", "+00:00")) == datetime.fromisoformat(occurred)
+    assert imported["status"] == "HISTORY"
+    current = client.get("/v1/current", headers={"Authorization": f"Bearer {token}"}).json()["items"]
+    assert imported["id"] not in {item["id"] for item in current}
+    history = client.get("/v1/history", headers={"Authorization": f"Bearer {token}"}, params={"topic": "memory"}).json()["items"]
+    assert imported["id"] in {item["id"] for item in history}
+
+    key = rotate(client)
+    restored = bootstrap(client, key, product="DAOS", topic="memory").json()
+    assert imported["id"] not in {item["id"] for item in restored["current_context"]}
+    assert "Owner chose API" in {item["title"] for item in restored["owner_decisions"]}
+
+
+def test_historical_import_cannot_use_supersede_to_replace_current(client, store):
+    token, _ = access(client, product="DAOS", topic="memory")
+    old = next(item for item in store.events if item["title"] == "Zeus current note")
+    before = deepcopy(store.events)
+    response = client.post(
+        f"/v1/events/{old['id']}/supersede",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "product": "DAOS", "topic": "memory", "memory_type": "STRATEGY",
+            "event_type": "HISTORY_IMPORT", "title": "Old imported direction",
+            "summary": "Old imported direction", "content": "Old historical plan",
+            "source_interface": "chatgpt", "authority_level": "AGENT_ASSESSMENT",
+            "occurred_at": "2026-06-18T09:00:00+00:00",
+            "source_session_at": "2026-06-18T09:00:00+00:00",
+            "metadata": {},
+        },
+    )
+    assert response.status_code == 409
+    assert store.events == before
+    assert store.relations == []
 
 
 def test_event_metadata_over_json_byte_cap_is_rejected(client):

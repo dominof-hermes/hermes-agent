@@ -10,12 +10,14 @@ from uuid import uuid4
 import asyncpg
 
 
-_EVENT_COLUMNS = """id, created_at, actor, actor_role, source_interface, product, topic,
-thread_id, work_id, memory_type, event_type, title, summary, content, status,
-authority_level, source_ref, supersedes_id, metadata"""
+_EVENT_COLUMNS = """id, created_at, occurred_at, effective_from, effective_to, source_session_at,
+actor, actor_role, source_interface, product, topic, thread_id, work_id, memory_type,
+event_type, title, summary, content, status, authority_level, source_ref, supersedes_id, metadata"""
 _AUTHORITY_SQL = """CASE authority_level
 WHEN 'OWNER_DECISION' THEN 5 WHEN 'VERIFIED_EVIDENCE' THEN 4
 WHEN 'OPERATIONAL_STATE' THEN 3 WHEN 'AGENT_ASSESSMENT' THEN 2 ELSE 1 END"""
+_STATUS_SQL = """CASE status
+WHEN 'CURRENT' THEN 3 WHEN 'DRAFT' THEN 2 ELSE 1 END"""
 
 
 class AsyncpgStore:
@@ -121,7 +123,9 @@ class AsyncpgStore:
             WHERE {status_clause} AND ($1::text IS NULL OR product=$1)
               AND ($2::text IS NULL OR topic=$2)
               AND ($3::text IS NULL OR search_document @@ websearch_to_tsquery('simple',$3))
-            ORDER BY {_AUTHORITY_SQL} DESC, created_at DESC LIMIT $4""",
+            ORDER BY {_AUTHORITY_SQL} DESC, {_STATUS_SQL} DESC,
+              COALESCE(effective_from, occurred_at, created_at) DESC,
+              occurred_at DESC, created_at DESC LIMIT $4""",
             product, topic, query, limit, timeout=self.timeout,
         )
         return [_record(r) for r in rows]
@@ -188,12 +192,18 @@ async def _insert_event(conn, event: dict[str, Any], timeout: float) -> dict[str
     event_id = str(uuid4())
     row = await conn.fetchrow(
         f"""INSERT INTO daos_memory.context_events ({_EVENT_COLUMNS}) VALUES
-        ($1::uuid,now(),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::uuid,$18::jsonb)
+        ($1::uuid,now(),COALESCE($2::timestamptz,now()),
+         COALESCE($3::timestamptz,$2::timestamptz,now()),$4::timestamptz,
+         COALESCE($5::timestamptz,$2::timestamptz,now()),
+         $6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::uuid,$22::jsonb)
         RETURNING {_EVENT_COLUMNS}""",
-        event_id, event["actor"], event["actor_role"], event["source_interface"], event["product"],
-        event["topic"], event.get("thread_id"), event.get("work_id"), event["memory_type"],
-        event["event_type"], event["title"], event["summary"], event["content"], event["status"],
-        event["authority_level"], event.get("source_ref"), event.get("supersedes_id"),
+        event_id,
+        event.get("occurred_at"), event.get("effective_from"), event.get("effective_to"),
+        event.get("source_session_at"), event["actor"], event["actor_role"],
+        event["source_interface"], event["product"], event["topic"], event.get("thread_id"),
+        event.get("work_id"), event["memory_type"], event["event_type"], event["title"],
+        event["summary"], event["content"], event["status"], event["authority_level"],
+        event.get("source_ref"), event.get("supersedes_id"),
         json.dumps(event.get("metadata") or {}), timeout=timeout,
     )
     return _record(row)
