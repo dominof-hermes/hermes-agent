@@ -184,9 +184,13 @@ def test_dashboard_internal_coordinators_abort_stale_requests_and_trap_dialog_fo
     for start_marker, end_marker in (("function rotate", "function revoke"), ("function revoke", "let body")):
         action_source = source[source.index(start_marker):source.index(end_marker)]
         assert "actionChannelRef.current.start()" in action_source
+        assert "if (actionBusyRef.current) return" in action_source
+        assert "actionBusyRef.current = true" in action_source
         assert "signal: action.signal" in action_source
         assert "actionChannelRef.current.isCurrent(action.generation)" in action_source
         assert "viewRef.current !== actionView" in action_source
+    assert "actionBusyRef.current = false" in source
+    assert "disabled: busy" in source
 
 
 def test_migration_has_only_required_core_tables_and_hashed_credential_columns():

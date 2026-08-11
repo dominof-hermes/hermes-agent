@@ -186,6 +186,7 @@
     const onRotate = props.onRotate;
     const onRevoke = props.onRevoke;
     const secret = props.secret;
+    const busy = props.busy;
     return h(React.Fragment, null,
       secret && h("section", { className: "dm-secret", role: "status" },
         h("strong", null, "Bootstrap key — shown once"),
@@ -200,8 +201,8 @@
             h("td", null, agent.agent_id), h("td", null, h("span", { className: "dm-status" }, agent.status)),
             h("td", null, agent.last_access_at ? new Date(agent.last_access_at).toLocaleString() : "Never"),
             h("td", { className: "dm-actions" },
-              h("button", { onClick: function () { onRotate(agent.agent_id); } }, "Rotate"),
-              h("button", { className: "danger", onClick: function () { onRevoke(agent.agent_id); } }, "Revoke")
+              h("button", { disabled: busy, onClick: function () { onRotate(agent.agent_id); } }, "Rotate"),
+              h("button", { disabled: busy, className: "danger", onClick: function () { onRevoke(agent.agent_id); } }, "Revoke")
             )
           );
         }))
@@ -216,8 +217,10 @@
     const [secret, setSecret] = React.useState(null);
     const [error, setError] = React.useState("");
     const [loading, setLoading] = React.useState(true);
+    const [actionBusy, setActionBusy] = React.useState(false);
     const requestChannelRef = React.useRef(null);
     const actionChannelRef = React.useRef(null);
+    const actionBusyRef = React.useRef(false);
     const returnFocusRef = React.useRef(null);
     const viewRef = React.useRef(view);
     if (!requestChannelRef.current) requestChannelRef.current = createLatestRequestChannel();
@@ -252,7 +255,6 @@
       setSecret(null); setSelectedEvent(null); load(view);
       return function () {
         requestChannelRef.current.invalidate();
-        actionChannelRef.current.invalidate();
       };
     }, [view]);
 
@@ -262,6 +264,9 @@
     }
 
     function rotate(agent) {
+      if (actionBusyRef.current) return;
+      actionBusyRef.current = true;
+      setActionBusy(true);
       const actionView = view;
       const action = actionChannelRef.current.start();
       setSecret(null); setError("");
@@ -275,12 +280,17 @@
         if (caught && caught.name === "AbortError") return;
         setSecret(null); setError("Rotation unavailable; no credential was issued.");
       }).finally(function () {
-        if (!actionChannelRef.current.isCurrent(action.generation) || viewRef.current !== actionView) return;
+        if (!actionChannelRef.current.isCurrent(action.generation)) return;
         actionChannelRef.current.finish(action.generation);
+        actionBusyRef.current = false;
+        setActionBusy(false);
       });
     }
 
     function revoke(agent) {
+      if (actionBusyRef.current) return;
+      actionBusyRef.current = true;
+      setActionBusy(true);
       const actionView = view;
       const action = actionChannelRef.current.start();
       setSecret(null); setError("");
@@ -294,15 +304,19 @@
         if (caught && caught.name === "AbortError") return;
         setError("Revocation could not be verified; access is treated as unavailable.");
       }).finally(function () {
-        if (!actionChannelRef.current.isCurrent(action.generation) || viewRef.current !== actionView) return;
+        if (!actionChannelRef.current.isCurrent(action.generation)) return;
         actionChannelRef.current.finish(action.generation);
+        actionBusyRef.current = false;
+        setActionBusy(false);
       });
     }
 
     let body;
     if (loading) body = h("div", { className: "dm-empty" }, "Loading bounded view…");
     else if (view === "Policies") body = h(PolicyTable, { items: data.items });
-    else if (view === "Agent Access") body = h(AgentAccess, { items: data.items, secret: secret, onRotate: rotate, onRevoke: revoke });
+    else if (view === "Agent Access") body = h(AgentAccess, {
+      items: data.items, secret: secret, busy: actionBusy, onRotate: rotate, onRevoke: revoke
+    });
     else body = h(EventTable, { items: data.items, onSelect: openEvent });
 
     return h("main", { className: "dm-page" },
