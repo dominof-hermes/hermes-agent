@@ -217,11 +217,8 @@ class DecisionAction(BaseModel):
 
 
 class PolicyWrite(BaseModel):
-    category: str = Field(min_length=1, max_length=80)
     title: str = Field(min_length=1, max_length=240)
     content: str = Field(min_length=1, max_length=8000)
-    scope: str = Field(min_length=1, max_length=160)
-    status: Literal["DRAFT", "ACTIVE", "SUPERSEDED"] = "ACTIVE"
 
 
 class AgentNoteWrite(BaseModel):

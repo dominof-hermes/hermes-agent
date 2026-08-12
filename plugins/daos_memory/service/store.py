@@ -323,8 +323,11 @@ class AsyncpgStore:
 
     async def write_policy(self, values: dict[str, Any]):
         pool = await self._get_pool()
-        version = await pool.fetchval("SELECT COALESCE(max(version),0)+1 FROM daos_memory.canonical_policies WHERE category=$1 AND title=$2", values["category"], values["title"], timeout=self.timeout)
-        row = await pool.fetchrow("INSERT INTO daos_memory.canonical_policies(id,category,title,content,scope,status,version) VALUES($1::uuid,$2,$3,$4,$5,$6,$7) RETURNING *", str(uuid4()), values["category"], values["title"], values["content"], values["scope"], values["status"], version, timeout=self.timeout)
+        version = await pool.fetchval("SELECT COALESCE(max(version),0)+1 FROM daos_memory.canonical_policies WHERE title=$1", values["title"], timeout=self.timeout)
+        row = await pool.fetchrow("""INSERT INTO daos_memory.canonical_policies
+          (id,category,title,content,scope,status,version,author)
+          VALUES($1::uuid,'GENERAL',$2,$3,'GLOBAL','ACTIVE',$4,$5) RETURNING *""",
+          str(uuid4()), values["title"], values["content"], version, values["author"], timeout=self.timeout)
         return _json_record(row)
 
     async def write_agent_note(self, actor: str, actor_role: str, values: dict[str, Any]):

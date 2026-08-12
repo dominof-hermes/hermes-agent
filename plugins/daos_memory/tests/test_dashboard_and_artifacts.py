@@ -148,6 +148,20 @@ def test_dashboard_has_owner_decision_policy_and_copy_contracts():
     assert "Auto-generate" not in script
 
 
+def test_policy_ui_has_owner_writing_fields_and_visible_metadata():
+    script = (ROOT / "dashboard" / "dist" / "index.js").read_text()
+    policy_source = script[script.index("function PolicyTable"):script.index("function AgentAccess")]
+    for label in ("Title", "Author", "Registered / Updated", "Content"):
+        assert label in policy_source
+    assert "item.author" in policy_source
+    assert "item.created_at" in policy_source
+    assert "item.updated_at" in policy_source
+    assert "function PolicyComposer" in script
+    assert 'name: "title"' in script
+    assert 'name: "content"' in script
+    assert "window.prompt" not in script
+
+
 def test_event_rows_open_one_shared_read_only_detail_drawer_with_full_content():
     script = (ROOT / "dashboard" / "dist" / "index.js").read_text()
     style = (ROOT / "dashboard" / "dist" / "style.css").read_text()

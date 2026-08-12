@@ -257,8 +257,10 @@ class FakeStore:
 
     async def write_policy(self, values):
         version = 1 + max((item.get("version", 0) for item in self.policies
-                           if item.get("category") == values["category"] and item.get("title") == values["title"]), default=0)
-        row = {**deepcopy(values), "id": str(uuid4()), "version": version, "created_at": NOW, "updated_at": NOW}
+                           if item.get("title") == values["title"]), default=0)
+        row = {**deepcopy(values), "id": str(uuid4()), "version": version,
+               "category": "GENERAL", "scope": "GLOBAL", "status": "ACTIVE",
+               "created_at": NOW, "updated_at": NOW}
         self.policies.append(row)
         return deepcopy(row)
 
@@ -694,8 +696,13 @@ def test_agent_proposes_decision_and_owner_alone_can_approve(client, store):
 
 
 def test_owner_alone_creates_policy(client):
-    payload = {"category": "WRITE_GUIDE", "title": "Writing", "content": "Write directly.", "scope": "GLOBAL", "status": "ACTIVE"}
+    payload = {"title": "Writing", "content": "Write directly."}
     assert client.post("/v1/admin/policies", json=payload).status_code == 401
     created = client.post("/v1/admin/policies", headers={"Authorization": "Bearer owner-secret"}, json=payload)
     assert created.status_code == 201
+    assert created.json()["author"] == "Owner"
+    assert created.json()["title"] == "Writing"
+    assert created.json()["content"] == "Write directly."
+    assert created.json()["created_at"]
+    assert created.json()["updated_at"]
     assert created.json()["version"] == 1

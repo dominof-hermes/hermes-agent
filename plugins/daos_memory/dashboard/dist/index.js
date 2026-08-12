@@ -293,9 +293,36 @@
     if (!items.length) return h("div", { className: "dm-empty" }, "No active policies.");
     return h("div", { className: "dm-cards" }, items.map(function (item) {
       return h("article", { className: "dm-card", key: item.id },
-        h("span", { className: "dm-kicker" }, item.category), h("h3", null, item.title), h("p", null, item.content)
+        h("dl", { className: "dm-detail-grid" },
+          h("div", { className: "dm-detail-field wide" }, h("dt", null, "Title"), h("dd", null, item.title)),
+          h("div", { className: "dm-detail-field" }, h("dt", null, "Author"), h("dd", null, item.author || "Owner")),
+          h("div", { className: "dm-detail-field" }, h("dt", null, "Registered / Updated"),
+            h("dd", null, new Date(item.created_at).toLocaleString() + " / " + new Date(item.updated_at).toLocaleString())),
+          h("div", { className: "dm-detail-field wide dm-detail-content" }, h("dt", null, "Content"), h("dd", null, item.content))
+        )
       );
     }));
+  }
+
+  function PolicyComposer(props) {
+    const [title, setTitle] = React.useState("");
+    const [content, setContent] = React.useState("");
+    function submit(event) {
+      event.preventDefault();
+      if (!title.trim() || !content.trim()) return;
+      props.onSubmit({ title: title.trim(), content: content.trim() }).then(function () {
+        setTitle(""); setContent("");
+      });
+    }
+    return h("form", { className: "dm-card dm-policy-composer", onSubmit: submit },
+      h("h2", null, "Create Policy"),
+      h("label", null, "Title", h("input", { name: "title", value: title, maxLength: 240, required: true,
+        onChange: function (event) { setTitle(event.target.value); } })),
+      h("label", null, "Author", h("input", { value: "Owner", readOnly: true })),
+      h("label", null, "Content", h("textarea", { name: "content", value: content, maxLength: 8000, required: true,
+        onChange: function (event) { setContent(event.target.value); } })),
+      h("button", { type: "submit", disabled: props.busy }, props.busy ? "Registering…" : "Register")
+    );
   }
 
   function AgentAccess(props) {
@@ -575,14 +602,12 @@
         .catch(function () { setError("Decision update unavailable."); });
     }
 
-    function createPolicy() {
-      const title = window.prompt("Policy title");
-      if (!title) return;
-      const content = window.prompt("Policy content");
-      if (!content) return;
-      api("/policies", { method: "POST", body: JSON.stringify({ category: "GENERAL", title: title, content: content, scope: "GLOBAL", status: "ACTIVE" }) })
+    function createPolicy(values) {
+      setActionBusy(true); setError("");
+      return api("/policies", { method: "POST", body: JSON.stringify(values) })
         .then(function () { load("Policies"); })
-        .catch(function () { setError("Policy creation unavailable."); });
+        .catch(function () { setError("Policy creation unavailable."); throw new Error("policy creation failed"); })
+        .finally(function () { setActionBusy(false); });
     }
 
     let body;
@@ -590,10 +615,11 @@
     else if (view === "Agent Access") body = h(AgentAccess, {
       items: data.items, secret: secret, busy: actionBusy, onRotate: rotate, onRevoke: revoke
     });
-    else body = h(React.Fragment, null,
-      view === "Policies" && h("button", { onClick: createPolicy }, "Create Policy"),
-      h(EventTable, { items: data.items, view: view, onSelect: openEvent, onSourceSelect: openSource, onDecision: decide })
+    else if (view === "Policies") body = h(React.Fragment, null,
+      h(PolicyComposer, { onSubmit: createPolicy, busy: actionBusy }),
+      h(PolicyTable, { items: data.items })
     );
+    else body = h(EventTable, { items: data.items, view: view, onSelect: openEvent, onSourceSelect: openSource, onDecision: decide });
 
     return h("main", { className: "dm-page" },
       h("header", { className: "dm-header" }, h("div", null,

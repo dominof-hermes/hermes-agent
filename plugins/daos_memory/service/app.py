@@ -266,7 +266,7 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
 
     @app.post("/v1/admin/policies", status_code=201, dependencies=[Depends(owner_auth)])
     async def create_policy(body: PolicyWrite):
-        return await bounded(store.write_policy(body.model_dump()))
+        return await bounded(store.write_policy({**body.model_dump(), "author": "Owner"}))
 
     @app.get("/v1/admin/policies", dependencies=[Depends(owner_auth)])
     async def admin_policies():
