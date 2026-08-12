@@ -290,7 +290,7 @@
 
   function PolicyTable(props) {
     const items = props.items || [];
-    if (!items.length) return h("div", { className: "dm-empty" }, "No active policies.");
+    if (!items.length) return h("div", { className: "dm-empty" }, "No records in this bounded view.");
     return h("div", { className: "dm-cards" }, items.map(function (item) {
       return h("article", {
         className: "dm-card dm-policy-card", key: item.id, role: "button", tabIndex: 0,
@@ -340,7 +340,10 @@
       h("label", null, "Author", h("input", { value: "Owner", readOnly: true })),
       h("label", null, "Content", h("textarea", { name: "content", value: content, maxLength: 8000, required: true,
         onChange: function (event) { setContent(event.target.value); } })),
-      h("button", { type: "submit", disabled: props.busy }, props.busy ? "Registering…" : "Register")
+      h("div", { className: "dm-policy-form-actions" },
+        h("button", { type: "button", disabled: props.busy, onClick: props.onCancel }, "Cancel"),
+        h("button", { type: "submit", disabled: props.busy }, props.busy ? "Registering…" : "Register")
+      )
     );
   }
 
@@ -388,6 +391,7 @@
     const [eventKnowledgeStatus, setEventKnowledgeStatus] = React.useState("idle");
     const [selectedSource, setSelectedSource] = React.useState(null);
     const [selectedPolicy, setSelectedPolicy] = React.useState(null);
+    const [policyComposerOpen, setPolicyComposerOpen] = React.useState(false);
     const [secret, setSecret] = React.useState(null);
     const [error, setError] = React.useState("");
     const [loading, setLoading] = React.useState(true);
@@ -563,6 +567,7 @@
     function selectView(name) {
       detailChannelRef.current.invalidate(); knowledgeChannelRef.current.invalidate(); sourceChannelRef.current.invalidate();
       setSelectedEvent(null); setEventKnowledge(null); setEventKnowledgeStatus("idle"); setSelectedSource(null);
+      setSelectedPolicy(null); setPolicyComposerOpen(false);
       window.history.replaceState({ dmMemoryList: { view: name, scrollY: 0 } }, "", "/memory");
       setView(name);
       window.scrollTo(0, 0);
@@ -625,7 +630,7 @@
     function createPolicy(values) {
       setActionBusy(true); setError("");
       return api("/policies", { method: "POST", body: JSON.stringify(values) })
-        .then(function () { load("Policies"); })
+        .then(function () { setPolicyComposerOpen(false); load("Policies"); })
         .catch(function () { setError("Policy creation unavailable."); throw new Error("policy creation failed"); })
         .finally(function () { setActionBusy(false); });
     }
@@ -636,8 +641,13 @@
       items: data.items, secret: secret, busy: actionBusy, onRotate: rotate, onRevoke: revoke
     });
     else if (view === "Policies") body = h(React.Fragment, null,
-      h(PolicyComposer, { onSubmit: createPolicy, busy: actionBusy }),
-      h(PolicyTable, { items: data.items, onSelect: setSelectedPolicy })
+      h("div", { className: "dm-policy-list-header" },
+        h("h2", null, "Policies"),
+        !policyComposerOpen && h("button", { onClick: function () { setPolicyComposerOpen(true); } }, "글 등록하기")
+      ),
+      policyComposerOpen
+        ? h(PolicyComposer, { onSubmit: createPolicy, onCancel: function () { setPolicyComposerOpen(false); }, busy: actionBusy })
+        : h(PolicyTable, { items: data.items, onSelect: setSelectedPolicy })
     );
     else body = h(EventTable, { items: data.items, view: view, onSelect: openEvent, onSourceSelect: openSource, onDecision: decide });
 
