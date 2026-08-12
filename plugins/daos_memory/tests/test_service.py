@@ -259,7 +259,7 @@ class FakeStore:
         version = 1 + max((item.get("version", 0) for item in self.policies
                            if item.get("title") == values["title"]), default=0)
         row = {**deepcopy(values), "id": str(uuid4()), "version": version,
-               "category": "GENERAL", "scope": "GLOBAL", "status": "ACTIVE",
+               "category": "GLOBAL", "scope": "GLOBAL", "status": "ACTIVE",
                "created_at": NOW, "updated_at": NOW}
         self.policies.append(row)
         return deepcopy(row)
@@ -701,6 +701,7 @@ def test_owner_alone_creates_policy(client):
     created = client.post("/v1/admin/policies", headers={"Authorization": "Bearer owner-secret"}, json=payload)
     assert created.status_code == 201
     assert created.json()["author"] == "Owner"
+    assert created.json()["category"] == "GLOBAL"
     assert created.json()["title"] == "Writing"
     assert created.json()["content"] == "Write directly."
     assert created.json()["created_at"]

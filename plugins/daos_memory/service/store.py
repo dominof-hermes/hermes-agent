@@ -326,7 +326,7 @@ class AsyncpgStore:
         version = await pool.fetchval("SELECT COALESCE(max(version),0)+1 FROM daos_memory.canonical_policies WHERE title=$1", values["title"], timeout=self.timeout)
         row = await pool.fetchrow("""INSERT INTO daos_memory.canonical_policies
           (id,category,title,content,scope,status,version,author)
-          VALUES($1::uuid,'GENERAL',$2,$3,'GLOBAL','ACTIVE',$4,$5) RETURNING *""",
+          VALUES($1::uuid,'GLOBAL',$2,$3,'GLOBAL','ACTIVE',$4,$5) RETURNING *""",
           str(uuid4()), values["title"], values["content"], version, values["author"], timeout=self.timeout)
         return _json_record(row)
 
