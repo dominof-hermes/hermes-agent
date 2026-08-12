@@ -629,7 +629,9 @@
 
     function createPolicy(values) {
       setActionBusy(true); setError("");
-      return api("/policies", { method: "POST", body: JSON.stringify(values) })
+      return api("/policies", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(values)
+      })
         .then(function () { setPolicyComposerOpen(false); load("Policies"); })
         .catch(function () { setError("Policy creation unavailable."); throw new Error("policy creation failed"); })
         .finally(function () { setActionBusy(false); });

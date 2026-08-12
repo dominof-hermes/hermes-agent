@@ -160,6 +160,7 @@ def test_policy_ui_has_owner_writing_fields_and_visible_metadata():
     assert 'name: "title"' in script
     assert 'name: "content"' in script
     assert "window.prompt" not in script
+    assert 'headers: { "Content-Type": "application/json" }' in script
 
 
 def test_event_rows_open_one_shared_read_only_detail_drawer_with_full_content():
