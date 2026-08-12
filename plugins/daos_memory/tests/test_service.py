@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -11,9 +12,16 @@ from fastapi.testclient import TestClient
 from plugins.daos_memory.service.app import create_app
 from plugins.daos_memory.service.auth import hash_credential
 from plugins.daos_memory.service.config import Settings
+from plugins.daos_memory.scripts.import_source_grounded_pilot import _validate_manifest
+from plugins.daos_memory.service.models import SourceWrite
 
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+
+
+def test_pilot_manifest_rejects_duplicate_relation_ids():
+    with pytest.raises(ValueError, match="relation ids must be unique"):
+        _validate_manifest({"relations": [{"id": "same"}, {"id": "same"}]})
 
 
 class FakeStore:
@@ -61,6 +69,16 @@ class FakeStore:
             self._event("DAOS", "memory", "ASSESSMENT", "Old note", "SUPERSEDED", "AGENT_ASSESSMENT", "zeus"),
         ]
         self.relations = []
+        source_content = "# Raw source\n\nOwner and Zeus discussed source-grounded memory."
+        self.sources = [{
+            "id": str(uuid4()), "source_type": "CHAT_CONVERSATION", "title": "Raw source",
+            "source_interface": "slack", "actor": "owner", "participants": ["owner", "zeus"],
+            "repository": None, "path": None, "commit_sha": None, "source_url": None,
+            "occurred_at": NOW, "source_session_at": NOW, "indexed_at": NOW,
+            "content": source_content, "content_hash": hashlib.sha256(source_content.encode()).hexdigest(),
+            "access_scope": "OWNER", "security_level": "INTERNAL",
+            "redaction_status": "REVIEWED_NO_SECRETS", "metadata": {},
+        }]
         self.healthy = True
 
     @staticmethod
@@ -187,6 +205,39 @@ class FakeStore:
         elif view == "knowledge_vault": rows = [e for e in rows if e["memory_type"] in {"RESEARCH", "ARCHITECTURE_ASSESSMENT", "DESIGN_PROPOSAL", "EVIDENCE", "TECHNICAL_RESULT", "SESSION_SUMMARY"}]
         else: rows = [e for e in rows if e["status"] == "CURRENT"]
         return deepcopy(rows[:limit])
+
+    async def read_operational_current(self, product, topic, limit):
+        rows = [e for e in self.events if e["status"] == "CURRENT" and e["memory_type"] in {"EXECUTION", "NEXT_ACTION", "OPERATIONAL_STATE"}]
+        return deepcopy(rows[:limit])
+
+    async def read_active_knowledge(self, product, topic, limit):
+        rows = [e for e in self.events if e["status"] == "CURRENT" and e["memory_type"] in {"STRATEGY", "RESEARCH", "EVIDENCE", "ARCHITECTURE_ASSESSMENT", "DESIGN_PROPOSAL", "IDEA", "DESIGN_OPTION", "LESSON_LEARNED", "ENGINEERING_KNOWLEDGE", "ARCHITECTURE_DECISION"}]
+        return deepcopy(rows[:limit])
+
+    async def read_source(self, source_id):
+        return deepcopy(next((s for s in self.sources if s["id"] == source_id), None))
+
+    async def read_event_knowledge(self, event_id):
+        source = deepcopy(self.sources[0])
+        return {
+            "event_id": event_id, "evidence_status": "grounded", "related_events": [],
+            "sources": [source],
+            "relations": [{
+                "id": str(uuid4()), "relation_type": "SUMMARIZES",
+                "from_event_id": event_id, "from_source_id": None,
+                "to_event_id": None, "to_source_id": source["id"],
+            }],
+        }
+
+    async def write_source(self, source):
+        row = {**deepcopy(source), "id": str(uuid4()), "indexed_at": NOW}
+        self.sources.append(row)
+        return deepcopy(row)
+
+    async def write_knowledge_relation(self, relation):
+        row = {**deepcopy(relation), "id": str(uuid4()), "created_at": NOW}
+        self.relations.append(row)
+        return deepcopy(row)
 
 
 @pytest.fixture
@@ -496,3 +547,100 @@ def test_access_token_expires_and_is_revoked_with_agent(client, store):
     token, _ = access(client)
     client.post("/v1/admin/agents/zeus/revoke", headers={"Authorization": "Bearer owner-secret"})
     assert client.get("/v1/current", headers={"Authorization": f"Bearer {token}"}).status_code == 401
+
+
+def test_bootstrap_prioritizes_operational_current_and_bounds_topic_active_knowledge(client):
+    key = rotate(client)
+    payload = bootstrap(client, key, product="DAOS", topic="memory").json()
+
+    assert payload["history"] == []
+    assert payload["current_context"] == []
+    assert {item["title"] for item in payload["next_actions"]} == {"Ship v0.1", "Owner follow-up"}
+    assert {item["title"] for item in payload["active_knowledge"]} == {"Verified benchmark"}
+
+
+def test_operational_next_actions_are_not_starved_by_twenty_higher_authority_knowledge_rows(client, store):
+    template = deepcopy(next(event for event in store.events if event["title"] == "Verified benchmark"))
+    saturated = []
+    for index in range(25):
+        item = deepcopy(template)
+        item.update(id=str(uuid4()), title=f"High authority knowledge {index}", summary=f"High authority knowledge {index}")
+        saturated.append(item)
+    store.events = saturated + store.events
+
+    key = rotate(client)
+    payload = bootstrap(client, key, product="DAOS", topic="memory").json()
+
+    assert {item["title"] for item in payload["next_actions"]} == {"Ship v0.1", "Owner follow-up"}
+    assert len(payload["active_knowledge"]) <= 5
+
+
+def test_owner_can_follow_event_knowledge_to_raw_source_without_mutation(client, store):
+    event = next(e for e in store.events if e["title"] == "Owner chose API")
+    before_events = deepcopy(store.events)
+    before_sources = deepcopy(store.sources)
+
+    knowledge = client.get(
+        f"/v1/admin/events/{event['id']}/knowledge",
+        headers={"Authorization": "Bearer owner-secret"},
+    )
+    assert knowledge.status_code == 200
+    assert knowledge.json()["evidence_status"] == "grounded"
+    source_id = knowledge.json()["sources"][0]["id"]
+    source = client.get(
+        f"/v1/admin/sources/{source_id}",
+        headers={"Authorization": "Bearer owner-secret"},
+    )
+    assert source.status_code == 200
+    assert source.json()["content"].startswith("# Raw source")
+    assert source.json()["content_hash"] == hashlib.sha256(source.json()["content"].encode()).hexdigest()
+    assert store.events == before_events and store.sources == before_sources
+
+
+def test_source_write_requires_exact_hash_and_rejects_embedded_credentials():
+    content = "# Reviewed source\n\nNo credentials are present."
+    base = {
+        "source_type": "CHAT_CONVERSATION", "title": "Reviewed source",
+        "source_interface": "slack", "actor": "owner", "participants": ["owner", "zeus"],
+        "occurred_at": NOW, "source_session_at": NOW, "content": content,
+        "content_hash": hashlib.sha256(content.encode()).hexdigest(),
+        "access_scope": "OWNER", "security_level": "INTERNAL",
+        "redaction_status": "REVIEWED_NO_SECRETS", "metadata": {},
+    }
+    assert SourceWrite(**base).content_hash == base["content_hash"]
+    with pytest.raises(ValueError, match="content_hash"):
+        SourceWrite(**{**base, "content_hash": "0" * 64})
+    with pytest.raises(ValueError, match="credential"):
+        leaked = content + "\naccess_token=plain-secret-value"
+        SourceWrite(**{**base, "content": leaked, "content_hash": hashlib.sha256(leaked.encode()).hexdigest()})
+    with pytest.raises(ValueError, match="UTF-8 bytes"):
+        multibyte = "가" * 174763
+        SourceWrite(**{**base, "content": multibyte, "content_hash": hashlib.sha256(multibyte.encode()).hexdigest()})
+
+
+def test_owner_source_and_relation_writes_use_canonical_ids(client, store):
+    content = "# Exact source\n\nReviewed Owner conversation."
+    payload = {
+        "source_type": "SLACK_THREAD", "title": "Exact source", "source_interface": "slack",
+        "actor": "owner", "participants": ["owner", "zeus"], "occurred_at": NOW.isoformat(),
+        "source_session_at": NOW.isoformat(), "content": content,
+        "content_hash": hashlib.sha256(content.encode()).hexdigest(), "access_scope": "OWNER",
+        "security_level": "INTERNAL", "redaction_status": "REVIEWED_NO_SECRETS", "metadata": {},
+    }
+    headers = {"Authorization": "Bearer owner-secret"}
+    multibyte = "가" * 174763
+    rejected = client.post("/v1/admin/sources", headers=headers, json={
+        **payload, "content": multibyte, "content_hash": hashlib.sha256(multibyte.encode()).hexdigest(),
+    })
+    assert rejected.status_code == 422
+    created = client.post("/v1/admin/sources", headers=headers, json=payload)
+    assert created.status_code == 201
+    source_id = created.json()["id"]
+    event_id = next(event["id"] for event in store.events if event["title"] == "Owner chose API")
+    relation = client.post("/v1/admin/relations", headers=headers, json={
+        "relation_type": "SUMMARIZES", "from_event_id": event_id, "to_source_id": source_id,
+        "metadata": {"pilot": True},
+    })
+    assert relation.status_code == 201
+    assert relation.json()["from_event_id"] == event_id
+    assert relation.json()["to_source_id"] == source_id

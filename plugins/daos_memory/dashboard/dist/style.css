@@ -36,4 +36,10 @@
 .dm-detail-field dd { margin: 0; line-height: 1.55; overflow-wrap: anywhere; }
 .dm-detail-field.mono dd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; user-select: all; }
 .dm-detail-content dd { white-space: pre-wrap; max-height: none; }
+.dm-detail-content pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+.dm-knowledge-section { display: grid; gap: 8px; margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border, var(--ui-stroke-secondary)); }
+.dm-knowledge-section h3 { margin: 0 0 2px; font-size: 15px; }
+.dm-knowledge-section > a { display: block; border: 1px solid var(--border, var(--ui-stroke-secondary)); border-radius: 7px; padding: 10px 12px; color: var(--accent, var(--ui-accent)); text-decoration: none; }
+.dm-knowledge-section > a:hover, .dm-knowledge-section > a:focus-visible { text-decoration: underline; }
+.dm-relation { display: flex; justify-content: space-between; gap: 12px; border: 1px solid var(--border, var(--ui-stroke-secondary)); border-radius: 7px; padding: 9px 11px; overflow-wrap: anywhere; }
 @media (max-width: 720px) { .dm-page { padding: 14px; } .dm-header { flex-direction: column; } .dm-drawer { width: 100%; padding: 16px; } .dm-drawer-header { top: -16px; margin: -16px -16px 16px; padding: 16px; } .dm-detail-grid { grid-template-columns: 1fr; } .dm-detail-field.wide { grid-column: auto; } }

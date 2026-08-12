@@ -28,10 +28,31 @@
     return EVENT_ID_PATTERN.test(eventId) ? eventId : null;
   }
 
+  function sourcePath(sourceId) {
+    return "/memory/sources/" + encodeURIComponent(sourceId);
+  }
+
+  function sourceIdFromPath(pathname) {
+    const match = String(pathname || "").match(/^\/memory\/sources\/([^/]+)\/?$/);
+    if (!match) return null;
+    let sourceId;
+    try { sourceId = decodeURIComponent(match[1]); } catch (_) { return null; }
+    return EVENT_ID_PATTERN.test(sourceId) ? sourceId : null;
+  }
+
+  function relationTargetFor(itemId, relation) {
+    if (relation.from_event_id && relation.from_event_id !== itemId) return { kind: "event", id: relation.from_event_id };
+    if (relation.to_event_id && relation.to_event_id !== itemId) return { kind: "event", id: relation.to_event_id };
+    if (relation.from_source_id) return { kind: "source", id: relation.from_source_id };
+    if (relation.to_source_id) return { kind: "source", id: relation.to_source_id };
+    return null;
+  }
+
   const INITIAL_EVENT_ID = eventIdFromPath(window.location && window.location.pathname);
-  if (INITIAL_EVENT_ID) {
+  const INITIAL_SOURCE_ID = sourceIdFromPath(window.location && window.location.pathname);
+  if (INITIAL_EVENT_ID || INITIAL_SOURCE_ID) {
     const bootstrapState = {
-      dmMemoryDirect: INITIAL_EVENT_ID,
+      dmMemoryDirect: INITIAL_EVENT_ID || INITIAL_SOURCE_ID,
       dmMemoryList: { view: "Current", scrollY: 0 }
     };
     window.history.replaceState(bootstrapState, "", "/memory");
@@ -124,6 +145,8 @@
 
   function EventDetail(props) {
     const item = props.item;
+    const knowledge = props.knowledge || { related_events: [], sources: [], relations: [], evidence_status: "insufficient_evidence" };
+    const knowledgeStatus = props.knowledgeStatus || "loading";
     const onClose = props.onClose;
     const returnFocus = props.returnFocus;
     const closeRef = React.useRef(null);
@@ -147,23 +170,22 @@
     function value(raw, fallback) {
       return raw === null || raw === undefined || raw === "" ? (fallback || "—") : String(raw);
     }
-    function date(raw, fallback) {
-      return raw ? new Date(raw).toLocaleString() : (fallback || "—");
-    }
+    function date(raw, fallback) { return raw ? new Date(raw).toLocaleString() : (fallback || "—"); }
     function field(label, raw, wide, extraClass) {
       return h("div", { className: "dm-detail-field" + (wide ? " wide" : "") + (extraClass ? " " + extraClass : "") },
         h("dt", null, label), h("dd", null, value(raw))
       );
+    }
+    function endpoint(relation) {
+      const target = relationTargetFor(item.id, relation);
+      return target ? target.kind + ":" + target.id : "—";
     }
 
     return h("div", {
       className: "dm-drawer-backdrop",
       onMouseDown: function (event) { if (event.target === event.currentTarget) onClose(); }
     }, h("aside", {
-      ref: dialogRef,
-      className: "dm-drawer",
-      role: "dialog",
-      "aria-modal": "true",
+      ref: dialogRef, className: "dm-drawer", role: "dialog", "aria-modal": "true",
       "aria-labelledby": "dm-event-detail-title"
     },
       h("header", { className: "dm-drawer-header" }, h("div", null,
@@ -171,31 +193,92 @@
         h("h2", { id: "dm-event-detail-title" }, value(item.title, "Memory Event"))
       ), h("button", { ref: closeRef, onClick: onClose, "aria-label": "Close event detail" }, "Close")),
       h("dl", { className: "dm-detail-grid" },
-        h("div", { className: "dm-detail-field wide mono" },
-          h("dt", null, "Event ID"), h("dd", null,
-            h("a", { href: eventPath(item.id) }, value(item.id))
-          )
-        ),
-        field("Product", item.product), field("Topic", item.topic),
-        field("Title", item.title, true),
+        h("div", { className: "dm-detail-field wide mono" }, h("dt", null, "Event ID"),
+          h("dd", null, h("a", { href: eventPath(item.id) }, value(item.id)))),
+        field("Product", item.product), field("Topic", item.topic), field("Title", item.title, true),
         field("Summary", item.summary, true),
         h("div", { className: "dm-detail-field wide dm-detail-content" },
-          h("dt", null, "Full Content"), h("dd", null, value(item.content))
-        ),
+          h("dt", null, "Full Content"), h("dd", null, value(item.content))),
         field("Memory Type", item.memory_type), field("Event Type", item.event_type),
         field("Status", item.status), field("Authority Level", item.authority_level),
         field("Actor", item.actor), field("Actor Role", item.actor_role),
         field("Source Interface", item.source_interface), field("Source Ref", item.source_ref, true),
-        field("Occurred At", date(item.occurred_at)),
-        field("Stored At", date(item.created_at)),
-        field("Effective From", date(item.effective_from)),
-        field("Effective To", date(item.effective_to)),
+        field("Occurred At", date(item.occurred_at)), field("Stored At", date(item.created_at)),
+        field("Effective From", date(item.effective_from)), field("Effective To", date(item.effective_to)),
         field("Source Session At", date(item.source_session_at)),
         field("Updated At", date(item.updated_at, "— (immutable event)")),
         field("Supersedes", item.supersedes_id, true, "mono"),
         field("Related Event", item.related_event_id || item.related_event, true, "mono")
-      )
+      ),
+      knowledgeStatus === "loading" ? h("section", { className: "dm-knowledge-section", "aria-live": "polite" },
+        h("h3", null, "Related Knowledge"), h("p", null, "Loading provenance…")) :
+      knowledgeStatus === "unavailable" ? h("section", { className: "dm-knowledge-section" },
+        h("h3", null, "Related Knowledge"), h(ErrorBox, { message: "Knowledge provenance unavailable (fail closed)." })) :
+      h("div", { className: "dm-knowledge-stack" },
+      h("section", { className: "dm-knowledge-section" }, h("h3", null, "Related Knowledge"),
+        knowledge.related_events && knowledge.related_events.length ? knowledge.related_events.map(function (related) {
+          return h("a", { key: related.id, href: eventPath(related.id), onClick: function (event) {
+            event.preventDefault(); props.onEventSelect(related.id);
+          } }, related.memory_type + " · " + related.title);
+        }) : h("p", null, "No related knowledge registered.")),
+      h("section", { className: "dm-knowledge-section" }, h("h3", null, "Source Documents"),
+        h("span", { className: "dm-status" }, knowledge.evidence_status || "insufficient_evidence"),
+        knowledge.sources && knowledge.sources.length ? knowledge.sources.map(function (source) {
+          return h("a", { key: source.id, href: sourcePath(source.id), onClick: function (event) {
+            event.preventDefault(); props.onSourceSelect(source.id);
+          } }, source.source_type + " · " + source.title);
+        }) : h("p", null, "insufficient_evidence")),
+      h("section", { className: "dm-knowledge-section" }, h("h3", null, "Relations"),
+        knowledge.relations && knowledge.relations.length ? knowledge.relations.map(function (relation) {
+          const target = relationTargetFor(item.id, relation);
+          return h("div", { className: "dm-relation mono", key: relation.id },
+            h("strong", null, relation.relation_type), target ? h("a", {
+              href: target.kind === "event" ? eventPath(target.id) : sourcePath(target.id),
+              onClick: function (event) {
+                event.preventDefault();
+                if (target.kind === "event") props.onEventSelect(target.id);
+                else props.onSourceSelect(target.id);
+              },
+              "aria-label": relation.relation_type + " " + endpoint(relation)
+            }, endpoint(relation)) : h("span", null, endpoint(relation)));
+        }) : h("p", null, "No canonical relations registered.")))
     ));
+  }
+
+  function SourceDetail(props) {
+    const source = props.source;
+    const closeRef = React.useRef(null);
+    const dialogRef = React.useRef(null);
+    React.useEffect(function () {
+      function handleKey(event) {
+        const focusable = dialogRef.current ? Array.prototype.slice.call(dialogRef.current.querySelectorAll('a[href], button:not([disabled]), [tabindex]:not([tabindex="-1"])')) : [];
+        handleDialogKey(event, focusable, props.onClose);
+      }
+      document.addEventListener("keydown", handleKey);
+      if (closeRef.current) closeRef.current.focus();
+      return function () { document.removeEventListener("keydown", handleKey); };
+    }, [props.onClose]);
+    function show(value) { return value === null || value === undefined || value === "" ? "—" : String(value); }
+    function row(label, value) { return h("div", { className: "dm-detail-field" }, h("dt", null, label), h("dd", null, show(value))); }
+    return h("div", { className: "dm-drawer-backdrop", onMouseDown: function (event) { if (event.target === event.currentTarget) props.onClose(); } },
+      h("aside", { ref: dialogRef, className: "dm-drawer", role: "dialog", "aria-modal": "true", "aria-labelledby": "dm-source-detail-title" },
+        h("header", { className: "dm-drawer-header" }, h("div", null,
+          h("span", { className: "dm-kicker" }, "Read-only raw source"),
+          h("h2", { id: "dm-source-detail-title" }, show(source.title))),
+          h("button", { ref: closeRef, onClick: props.onClose, "aria-label": "Close source detail" }, "Close")),
+        h("dl", { className: "dm-detail-grid" },
+          h("div", { className: "dm-detail-field wide mono" }, h("dt", null, "Source ID"), h("dd", null, h("a", { href: sourcePath(source.id) }, source.id))),
+          row("Source Type", source.source_type), row("Source Interface", source.source_interface),
+          row("Actor", source.actor), row("Participants", (source.participants || []).join(", ")),
+          row("Occurred At", source.occurred_at ? new Date(source.occurred_at).toLocaleString() : "—"),
+          row("Source Session At", source.source_session_at ? new Date(source.source_session_at).toLocaleString() : "—"),
+          row("Repository", source.repository), row("Path", source.path), row("Commit SHA", source.commit_sha),
+          row("Content Hash", source.content_hash), row("Access Scope", source.access_scope),
+          row("Security Level", source.security_level), row("Redaction Status", source.redaction_status),
+          h("div", { className: "dm-detail-field wide dm-detail-content" }, h("dt", null, "Raw Source Content"),
+            h("dd", null, h("pre", null, show(source.content))))
+        )
+      ));
   }
 
   function PolicyTable(props) {
@@ -242,18 +325,25 @@
     const [view, setView] = React.useState(initialListState && VIEWS.includes(initialListState.view) ? initialListState.view : "Current");
     const [data, setData] = React.useState({ items: [] });
     const [selectedEvent, setSelectedEvent] = React.useState(null);
+    const [eventKnowledge, setEventKnowledge] = React.useState(null);
+    const [eventKnowledgeStatus, setEventKnowledgeStatus] = React.useState("idle");
+    const [selectedSource, setSelectedSource] = React.useState(null);
     const [secret, setSecret] = React.useState(null);
     const [error, setError] = React.useState("");
     const [loading, setLoading] = React.useState(true);
     const [actionBusy, setActionBusy] = React.useState(false);
     const requestChannelRef = React.useRef(null);
     const detailChannelRef = React.useRef(null);
+    const knowledgeChannelRef = React.useRef(null);
+    const sourceChannelRef = React.useRef(null);
     const actionChannelRef = React.useRef(null);
     const actionBusyRef = React.useRef(false);
     const returnFocusRef = React.useRef(null);
     const viewRef = React.useRef(view);
     if (!requestChannelRef.current) requestChannelRef.current = createLatestRequestChannel();
     if (!detailChannelRef.current) detailChannelRef.current = createLatestRequestChannel();
+    if (!knowledgeChannelRef.current) knowledgeChannelRef.current = createLatestRequestChannel();
+    if (!sourceChannelRef.current) sourceChannelRef.current = createLatestRequestChannel();
     if (!actionChannelRef.current) actionChannelRef.current = createLatestRequestChannel();
     viewRef.current = view;
 
@@ -283,6 +373,49 @@
       });
     }
 
+    function loadKnowledge(item) {
+      const request = knowledgeChannelRef.current.start();
+      setEventKnowledge(null);
+      setEventKnowledgeStatus("loading");
+      api("/events/" + encodeURIComponent(item.id) + "/knowledge", { signal: request.signal }).then(function (result) {
+        if (!knowledgeChannelRef.current.isCurrent(request.generation)) return;
+        setEventKnowledge(result); setEventKnowledgeStatus("ready");
+      }).catch(function (caught) {
+        if (!knowledgeChannelRef.current.isCurrent(request.generation) || (caught && caught.name === "AbortError")) return;
+        setEventKnowledge(null); setEventKnowledgeStatus("unavailable");
+      }).finally(function () {
+        if (knowledgeChannelRef.current.isCurrent(request.generation)) knowledgeChannelRef.current.finish(request.generation);
+      });
+    }
+
+    function loadDirectEvent(eventId) {
+      const request = detailChannelRef.current.start();
+      sourceChannelRef.current.invalidate(); setSelectedSource(null); setError("");
+      api("/events/" + encodeURIComponent(eventId), { signal: request.signal }).then(function (item) {
+        if (!detailChannelRef.current.isCurrent(request.generation)) return;
+        setSelectedEvent(item); loadKnowledge(item);
+      }).catch(function (caught) {
+        if (!detailChannelRef.current.isCurrent(request.generation) || (caught && caught.name === "AbortError")) return;
+        setSelectedEvent(null); setEventKnowledge(null); setEventKnowledgeStatus("idle"); setError("Memory event unavailable (fail closed).");
+      }).finally(function () {
+        if (detailChannelRef.current.isCurrent(request.generation)) detailChannelRef.current.finish(request.generation);
+      });
+    }
+
+    function loadDirectSource(sourceId) {
+      const request = sourceChannelRef.current.start();
+      detailChannelRef.current.invalidate(); knowledgeChannelRef.current.invalidate();
+      setSelectedEvent(null); setEventKnowledge(null); setEventKnowledgeStatus("idle"); setError("");
+      api("/sources/" + encodeURIComponent(sourceId), { signal: request.signal }).then(function (source) {
+        if (sourceChannelRef.current.isCurrent(request.generation)) setSelectedSource(source);
+      }).catch(function (caught) {
+        if (!sourceChannelRef.current.isCurrent(request.generation) || (caught && caught.name === "AbortError")) return;
+        setSelectedSource(null); setError("Memory source unavailable (fail closed).");
+      }).finally(function () {
+        if (sourceChannelRef.current.isCurrent(request.generation)) sourceChannelRef.current.finish(request.generation);
+      });
+    }
+
     React.useEffect(function () {
       setSecret(null); load(view);
       return function () {
@@ -300,40 +433,30 @@
         const schedule = window.requestAnimationFrame || function (callback) { return setTimeout(callback, 0); };
         schedule(function () { window.scrollTo(0, scrollY); });
       }
-      function loadDirectEvent(eventId) {
-        const request = detailChannelRef.current.start();
-        setError("");
-        api("/events/" + encodeURIComponent(eventId), { signal: request.signal }).then(function (item) {
-          if (!detailChannelRef.current.isCurrent(request.generation)) return;
-          setSelectedEvent(item);
-        }).catch(function (caught) {
-          if (!detailChannelRef.current.isCurrent(request.generation)) return;
-          if (caught && caught.name === "AbortError") return;
-          setSelectedEvent(null); setError("Memory event unavailable (fail closed).");
-        }).finally(function () {
-          if (detailChannelRef.current.isCurrent(request.generation)) detailChannelRef.current.finish(request.generation);
-        });
-      }
       function handlePopState(event) {
         const eventId = eventIdFromPath(window.location.pathname);
+        const sourceId = sourceIdFromPath(window.location.pathname);
         if (eventId) loadDirectEvent(eventId);
+        else if (sourceId) loadDirectSource(sourceId);
         else {
-          detailChannelRef.current.invalidate();
-          setSelectedEvent(null);
+          detailChannelRef.current.invalidate(); knowledgeChannelRef.current.invalidate(); sourceChannelRef.current.invalidate();
+          setSelectedEvent(null); setEventKnowledge(null); setEventKnowledgeStatus("idle"); setSelectedSource(null);
           restoreListState(event.state);
         }
       }
       window.addEventListener("popstate", handlePopState);
       const directEventId = INITIAL_EVENT_ID || eventIdFromPath(window.location.pathname);
+      const directSourceId = INITIAL_SOURCE_ID || sourceIdFromPath(window.location.pathname);
       if (directEventId) {
-        if (INITIAL_EVENT_ID) {
-          window.history.replaceState(window.history.state, "", eventPath(INITIAL_EVENT_ID));
-        }
+        if (INITIAL_EVENT_ID) window.history.replaceState(window.history.state, "", eventPath(INITIAL_EVENT_ID));
         loadDirectEvent(directEventId);
+      } else if (directSourceId) {
+        if (INITIAL_SOURCE_ID) window.history.replaceState(window.history.state, "", sourcePath(INITIAL_SOURCE_ID));
+        loadDirectSource(directSourceId);
       }
       return function () {
         window.removeEventListener("popstate", handlePopState);
-        detailChannelRef.current.invalidate();
+        detailChannelRef.current.invalidate(); knowledgeChannelRef.current.invalidate(); sourceChannelRef.current.invalidate();
       };
     }, []);
 
@@ -342,22 +465,35 @@
       const listState = { view: view, scrollY: window.scrollY || 0 };
       window.history.replaceState({ dmMemoryList: listState }, "", "/memory");
       window.history.pushState({ dmMemoryDetail: true, dmMemoryList: listState }, "", eventPath(item.id));
-      setSelectedEvent(item);
+      setSelectedSource(null); setSelectedEvent(item); loadKnowledge(item);
+    }
+
+    function openRelatedEvent(eventId) {
+      const listState = (window.history.state && window.history.state.dmMemoryList) || { view: view, scrollY: window.scrollY || 0 };
+      window.history.pushState({ dmMemoryDetail: true, dmMemoryList: listState }, "", eventPath(eventId));
+      loadDirectEvent(eventId);
+    }
+
+    function openSource(sourceId) {
+      const listState = (window.history.state && window.history.state.dmMemoryList) || { view: view, scrollY: window.scrollY || 0 };
+      window.history.pushState({ dmMemoryDetail: true, dmMemoryList: listState }, "", sourcePath(sourceId));
+      loadDirectSource(sourceId);
     }
 
     function closeEvent() {
-      if (eventIdFromPath(window.location.pathname) && window.history.state && window.history.state.dmMemoryDetail) {
+      const hasDetailPath = eventIdFromPath(window.location.pathname) || sourceIdFromPath(window.location.pathname);
+      if (hasDetailPath && window.history.state && window.history.state.dmMemoryDetail) {
         window.history.back();
         return;
       }
-      detailChannelRef.current.invalidate();
+      detailChannelRef.current.invalidate(); knowledgeChannelRef.current.invalidate(); sourceChannelRef.current.invalidate();
       window.history.replaceState({ dmMemoryList: { view: view, scrollY: window.scrollY || 0 } }, "", "/memory");
-      setSelectedEvent(null);
+      setSelectedEvent(null); setEventKnowledge(null); setEventKnowledgeStatus("idle"); setSelectedSource(null);
     }
 
     function selectView(name) {
-      detailChannelRef.current.invalidate();
-      setSelectedEvent(null);
+      detailChannelRef.current.invalidate(); knowledgeChannelRef.current.invalidate(); sourceChannelRef.current.invalidate();
+      setSelectedEvent(null); setEventKnowledge(null); setEventKnowledgeStatus("idle"); setSelectedSource(null);
       window.history.replaceState({ dmMemoryList: { view: name, scrollY: 0 } }, "", "/memory");
       setView(name);
       window.scrollTo(0, 0);
@@ -430,9 +566,14 @@
       body,
       selectedEvent && h(EventDetail, {
         item: selectedEvent,
+        knowledge: eventKnowledge,
+        knowledgeStatus: eventKnowledgeStatus,
         returnFocus: returnFocusRef.current,
+        onEventSelect: openRelatedEvent,
+        onSourceSelect: openSource,
         onClose: closeEvent
-      })
+      }),
+      selectedSource && h(SourceDetail, { source: selectedSource, onClose: closeEvent })
     );
   }
 
@@ -441,7 +582,11 @@
     handleDialogKey: handleDialogKey,
     eventPath: eventPath,
     eventIdFromPath: eventIdFromPath,
-    initialEventId: INITIAL_EVENT_ID
+    sourcePath: sourcePath,
+    sourceIdFromPath: sourceIdFromPath,
+    relationTargetFor: relationTargetFor,
+    initialEventId: INITIAL_EVENT_ID,
+    initialSourceId: INITIAL_SOURCE_ID
   };
   registry.register("daos_memory", MemoryPage);
 })();

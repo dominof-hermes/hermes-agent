@@ -353,6 +353,7 @@ plugins = [
   "**/README.md",
   "daos_memory/migrations/001_daos_memory_v01.sql",
   "daos_memory/migrations/002_event_temporal_validity.sql",
+  "daos_memory/migrations/003_source_grounded_knowledge.sql",
   "daos_memory/systemd/daos-memory.service",
   "daos_memory/systemd/daos-zeus-memory-action.service",
   "daos_memory/systemd/daos-memory-domain-cert-renew.service",

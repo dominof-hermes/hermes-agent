@@ -98,6 +98,27 @@ def test_dashboard_event_detail_proxy_is_owner_authenticated_and_read_only():
     assert len(seen) == 1
 
 
+def test_dashboard_knowledge_and_source_proxies_are_owner_authenticated_gets():
+    event_id = "11111111-1111-4111-8111-111111111111"
+    source_id = "22222222-2222-4222-8222-222222222222"
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        assert request.method == "GET"
+        assert request.headers["authorization"] == "Bearer owner-secret"
+        if request.url.path.endswith("/knowledge"):
+            return httpx.Response(200, json={"event_id": event_id, "evidence_status": "grounded", "sources": [], "related_events": [], "relations": []})
+        return httpx.Response(200, json={"id": source_id, "content": "raw"})
+
+    client = proxy_client(handler)
+    assert client.get(f"/events/{event_id}/knowledge").status_code == 200
+    assert client.get(f"/sources/{source_id}").status_code == 200
+    assert [request.url.path for request in seen] == [
+        f"/v1/admin/events/{event_id}/knowledge", f"/v1/admin/sources/{source_id}"
+    ]
+
+
 def test_dashboard_artifacts_define_top_level_memory_views():
     manifest = json.loads((ROOT / "dashboard" / "manifest.json").read_text())
     assert manifest["tab"]["path"] == "/memory"
@@ -161,6 +182,19 @@ def test_event_detail_uses_direct_url_and_browser_history_without_mutation_contr
       if (replacements[0] !== "/memory") throw new Error("shell bootstrap did not claim memory route");
       if (hooks.eventIdFromPath("/memory/events/not-a-uuid") !== null) throw new Error("invalid id accepted");
       if (hooks.eventIdFromPath("/memory") !== null) throw new Error("list route parsed as detail");
+      const other = "22222222-2222-4222-8222-222222222222";
+      const sourceId = "33333333-3333-4333-8333-333333333333";
+      const cases = [
+        [{{ from_event_id: id, to_event_id: other }}, "event", other],
+        [{{ from_event_id: other, to_event_id: id }}, "event", other],
+        [{{ from_event_id: id, to_source_id: sourceId }}, "source", sourceId],
+        [{{ from_source_id: sourceId, to_event_id: id }}, "source", sourceId]
+      ];
+      cases.forEach(function (entry) {{
+        const target = hooks.relationTargetFor(id, entry[0]);
+        if (!target || target.kind !== entry[1] || target.id !== entry[2]) throw new Error("opposite relation endpoint mismatch");
+      }});
+      if (hooks.sourceIdFromPath(hooks.sourcePath(sourceId)) !== sourceId) throw new Error("source route mismatch");
     """
     result = subprocess.run(["node", "-e", program], capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
@@ -173,6 +207,19 @@ def test_event_detail_uses_direct_url_and_browser_history_without_mutation_contr
     assert 'href: eventPath(item.id)' in source
     assert "Edit" not in source
     assert "Delete" not in source
+    for label in ("Related Knowledge", "Source Documents", "Relations", "insufficient_evidence"):
+        assert label in source
+    assert 'api("/events/" + encodeURIComponent(item.id) + "/knowledge"' in source
+    assert 'api("/sources/" + encodeURIComponent(sourceId)' in source
+    assert "/memory/sources/" in source
+    assert '"aria-label": relation.relation_type + " " + endpoint(relation)' in source
+    assert 'target.kind === "event" ? eventPath(target.id) : sourcePath(target.id)' in source
+    knowledge_loader = source.split("function loadKnowledge(item)", 1)[1].split("function loadDirectEvent", 1)[0]
+    assert 'setEventKnowledgeStatus("loading")' in knowledge_loader
+    assert 'setEventKnowledgeStatus("ready")' in knowledge_loader
+    assert 'setEventKnowledgeStatus("unavailable")' in knowledge_loader
+    assert "insufficient_evidence" not in knowledge_loader
+    assert "Knowledge provenance unavailable (fail closed)." in source
 
 
 def test_dashboard_internal_coordinators_abort_stale_requests_and_trap_dialog_focus():
@@ -276,6 +323,20 @@ def test_temporal_validity_migration_is_additive_backfilled_and_fail_safe():
     assert "delete from" not in sql
 
 
+def test_source_grounded_knowledge_migration_is_additive_and_canonical():
+    sql = (ROOT / "migrations" / "003_source_grounded_knowledge.sql").read_text().lower()
+    assert "create table daos_memory.knowledge_sources" in sql
+    assert "create table daos_memory.knowledge_relations" in sql
+    for column in ("content_hash", "access_scope", "security_level", "redaction_status", "source_session_at"):
+        assert column in sql
+    for relation in ("summarizes", "derived_from", "source_of", "related_to", "supersedes", "evidence_for", "decided_by", "implemented_by"):
+        assert relation in sql
+    assert "references daos_memory.context_events" in sql
+    assert "references daos_memory.knowledge_sources" in sql
+    assert "drop table" not in sql and "delete from" not in sql and "update daos_memory.context_events" not in sql
+
+
+
 def test_systemd_template_is_separate_bounded_and_hardened():
     unit = (ROOT / "systemd" / "daos-memory.service").read_text()
     assert "uvicorn" in unit
@@ -356,6 +417,7 @@ def test_wheel_package_data_declares_only_daos_runtime_artifacts():
     for artifact in (
         "daos_memory/migrations/001_daos_memory_v01.sql",
         "daos_memory/migrations/002_event_temporal_validity.sql",
+        "daos_memory/migrations/003_source_grounded_knowledge.sql",
         "daos_memory/systemd/daos-memory.service",
         "daos_memory/systemd/daos-zeus-memory-action.service",
         "daos_memory/openapi/zeus_memory_action.yaml",

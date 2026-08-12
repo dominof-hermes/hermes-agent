@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse
 
 from .auth import credential_matches, hash_credential, new_credential
 from .config import Settings
-from .models import BootstrapRequest, EventWrite, RotateRequest
+from .models import BootstrapRequest, EventWrite, KnowledgeRelationWrite, RotateRequest, SourceWrite
 
 _FORBIDDEN_QUERY_KEYS = {"key", "token", "access_token", "bootstrap_key", "owner_token"}
 _AGENT_AUTHORITIES = {"AGENT_ASSESSMENT", "HYPOTHESIS", "OPERATIONAL_STATE"}
@@ -31,7 +31,7 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
         if close:
             await close()
 
-    app = FastAPI(title="DAOS Memory Service", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="DAOS Memory Service", version="0.2.0", lifespan=lifespan)
 
     @app.middleware("http")
     async def reject_url_credentials(request: Request, call_next):
@@ -85,14 +85,18 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
         categories = ["GLOBAL", *[str(v).upper() for v in agent.get("role_categories", [])]]
         policies = await bounded(store.get_policies(categories, 20))
         events = await bounded(store.read_current(body.product, body.topic, min(settings.max_results, 20)))
+        operational = await bounded(store.read_operational_current(body.product, body.topic, min(settings.max_results, 20)))
+        active_knowledge = []
+        if body.topic:
+            active_knowledge = await bounded(store.read_active_knowledge(body.product, body.topic, min(settings.max_results, 5)))
         global_principles = [_compact_policy(p) for p in policies if p.get("category") == "GLOBAL"][:10]
         role_principles = [_compact_policy(p) for p in policies if p.get("category") != "GLOBAL"][:10]
         decisions = [_compact_event(e) for e in events
                      if e.get("memory_type") == "DECISION"
                      and e.get("authority_level") in {"OWNER_DECISION", "VERIFIED_EVIDENCE"}][:5]
-        next_actions = [_compact_event(e) for e in events if e.get("memory_type") == "NEXT_ACTION"][:5]
+        next_actions = [_compact_event(e) for e in operational if e.get("memory_type") == "NEXT_ACTION"][:5]
         excluded = {e["id"] for e in decisions + next_actions}
-        current = [_compact_event(e) for e in events if str(e.get("id")) not in excluded][:10]
+        current = [_compact_event(e) for e in operational if str(e.get("id")) not in excluded][:10]
         payload = {
             "agent_id": body.agent_id,
             "access_token": access_token,
@@ -103,6 +107,7 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
             "current_context": current,
             "owner_decisions": decisions,
             "next_actions": next_actions,
+            "active_knowledge": [_compact_event(e) for e in active_knowledge][:5],
             "history": [],
         }
         _enforce_bootstrap_size(payload, settings.max_bootstrap_bytes)
@@ -209,6 +214,28 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
         if not row:
             raise HTTPException(status_code=404, detail="event not found")
         return row
+
+    @app.get("/v1/admin/events/{event_id}/knowledge", dependencies=[Depends(owner_auth)])
+    async def admin_event_knowledge(event_id: UUID):
+        event = await bounded(store.read_event(str(event_id)))
+        if not event:
+            raise HTTPException(status_code=404, detail="event not found")
+        return await bounded(store.read_event_knowledge(str(event_id)))
+
+    @app.get("/v1/admin/sources/{source_id}", dependencies=[Depends(owner_auth)])
+    async def admin_source(source_id: UUID):
+        row = await bounded(store.read_source(str(source_id)))
+        if not row:
+            raise HTTPException(status_code=404, detail="source not found")
+        return row
+
+    @app.post("/v1/admin/sources", status_code=201, dependencies=[Depends(owner_auth)])
+    async def admin_write_source(body: SourceWrite):
+        return await bounded(store.write_source(body.model_dump()))
+
+    @app.post("/v1/admin/relations", status_code=201, dependencies=[Depends(owner_auth)])
+    async def admin_write_relation(body: KnowledgeRelationWrite):
+        return await bounded(store.write_knowledge_relation(body.model_dump()))
 
     @app.get("/v1/admin/policies", dependencies=[Depends(owner_auth)])
     async def admin_policies():

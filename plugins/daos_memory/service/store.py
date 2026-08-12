@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import asyncpg
 
@@ -13,6 +13,13 @@ import asyncpg
 _EVENT_COLUMNS = """id, created_at, occurred_at, effective_from, effective_to, source_session_at,
 actor, actor_role, source_interface, product, topic, thread_id, work_id, memory_type,
 event_type, title, summary, content, status, authority_level, source_ref, supersedes_id, metadata"""
+_SOURCE_COLUMNS = """id, source_type, title, source_interface, actor, participants,
+repository, path, commit_sha, source_url, occurred_at, source_session_at, indexed_at,
+content, content_hash, access_scope, security_level, redaction_status, metadata"""
+_OPERATIONAL_TYPES = "('EXECUTION','NEXT_ACTION','OPERATIONAL_STATE')"
+_ACTIVE_KNOWLEDGE_TYPES = """('STRATEGY','RESEARCH','EVIDENCE','ARCHITECTURE_ASSESSMENT',
+'DESIGN_PROPOSAL','IDEA','DESIGN_OPTION','LESSON_LEARNED','ENGINEERING_KNOWLEDGE',
+'ARCHITECTURE_DECISION')"""
 _AUTHORITY_SQL = """CASE authority_level
 WHEN 'OWNER_DECISION' THEN 5 WHEN 'VERIFIED_EVIDENCE' THEN 4
 WHEN 'OPERATIONAL_STATE' THEN 3 WHEN 'AGENT_ASSESSMENT' THEN 2 ELSE 1 END"""
@@ -113,6 +120,13 @@ class AsyncpgStore:
     async def read_current(self, product: str | None, topic: str | None, limit: int):
         return await self._events("status='CURRENT'", product, topic, None, limit)
 
+    async def read_operational_current(self, product: str | None, topic: str | None, limit: int):
+        clause = f"status='CURRENT' AND (memory_type IN {_OPERATIONAL_TYPES} OR event_type IN ('PRIORITY','BLOCKER','NEXT_ACTION','OPERATIONAL_STATE'))"
+        return await self._events(clause, product, topic, None, limit)
+
+    async def read_active_knowledge(self, product: str | None, topic: str | None, limit: int):
+        return await self._events(f"status='CURRENT' AND memory_type IN {_ACTIVE_KNOWLEDGE_TYPES}", product, topic, None, limit)
+
     async def search_history(self, product: str | None, topic: str | None, query: str | None, limit: int):
         return await self._events("status<>'CURRENT'", product, topic, query, limit)
 
@@ -142,6 +156,87 @@ class AsyncpgStore:
             timeout=self.timeout,
         )
         return _record(row) if row else None
+
+    async def read_source(self, source_id: str):
+        pool = await self._get_pool()
+        row = await pool.fetchrow(
+            f"SELECT {_SOURCE_COLUMNS} FROM daos_memory.knowledge_sources WHERE id=$1::uuid",
+            source_id, timeout=self.timeout,
+        )
+        return _source_record(row) if row else None
+
+    async def read_event_knowledge(self, event_id: str):
+        pool = await self._get_pool()
+        relation_rows = await pool.fetch(
+            """SELECT id, from_event_id, from_source_id, to_event_id, to_source_id,
+            relation_type, created_at, metadata FROM daos_memory.knowledge_relations
+            WHERE from_event_id=$1::uuid OR to_event_id=$1::uuid
+            ORDER BY created_at, id""",
+            event_id, timeout=self.timeout,
+        )
+        relations = [_relation_record(row) for row in relation_rows]
+        related_event_ids = {
+            str(value) for relation in relations
+            for value in (relation.get("from_event_id"), relation.get("to_event_id"))
+            if value is not None and str(value) != event_id
+        }
+        source_ids = {
+            str(value) for relation in relations
+            for value in (relation.get("from_source_id"), relation.get("to_source_id"))
+            if value is not None
+        }
+        events = []
+        if related_event_ids:
+            rows = await pool.fetch(
+                f"SELECT {_EVENT_COLUMNS} FROM daos_memory.context_events WHERE id=ANY($1::uuid[])",
+                [UUID(value) for value in sorted(related_event_ids)], timeout=self.timeout,
+            )
+            events = [_record(row) for row in rows]
+        sources = []
+        if source_ids:
+            rows = await pool.fetch(
+                f"SELECT {_SOURCE_COLUMNS} FROM daos_memory.knowledge_sources WHERE id=ANY($1::uuid[]) ORDER BY occurred_at, id",
+                [UUID(value) for value in sorted(source_ids)], timeout=self.timeout,
+            )
+            sources = [_source_record(row, include_content=False) for row in rows]
+        return {
+            "event_id": event_id,
+            "evidence_status": "grounded" if sources else "insufficient_evidence",
+            "related_events": events,
+            "sources": sources,
+            "relations": relations,
+        }
+
+    async def write_source(self, source: dict[str, Any]):
+        pool = await self._get_pool()
+        source_id = str(uuid4())
+        row = await pool.fetchrow(
+            f"""INSERT INTO daos_memory.knowledge_sources ({_SOURCE_COLUMNS}) VALUES
+            ($1::uuid,$2,$3,$4,$5,$6::text[],$7,$8,$9,$10,$11::timestamptz,
+             $12::timestamptz,now(),$13,$14,$15,$16,$17,$18::jsonb)
+            RETURNING {_SOURCE_COLUMNS}""",
+            source_id, source["source_type"], source["title"], source["source_interface"],
+            source["actor"], source.get("participants") or [], source.get("repository"),
+            source.get("path"), source.get("commit_sha"), source.get("source_url"),
+            source["occurred_at"], source["source_session_at"], source["content"],
+            source["content_hash"], source["access_scope"], source["security_level"],
+            source["redaction_status"], json.dumps(source.get("metadata") or {}), timeout=self.timeout,
+        )
+        return _source_record(row)
+
+    async def write_knowledge_relation(self, relation: dict[str, Any]):
+        pool = await self._get_pool()
+        relation_id = str(uuid4())
+        row = await pool.fetchrow(
+            """INSERT INTO daos_memory.knowledge_relations
+            (id,from_event_id,from_source_id,to_event_id,to_source_id,relation_type,metadata)
+            VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,$6,$7::jsonb)
+            RETURNING id,from_event_id,from_source_id,to_event_id,to_source_id,relation_type,created_at,metadata""",
+            relation_id, relation.get("from_event_id"), relation.get("from_source_id"),
+            relation.get("to_event_id"), relation.get("to_source_id"), relation["relation_type"],
+            json.dumps(relation.get("metadata") or {}), timeout=self.timeout,
+        )
+        return _relation_record(row)
 
     async def supersede_event(self, old_id: str, actor_id: str, event: dict[str, Any]):
         pool = await self._get_pool()
@@ -180,12 +275,12 @@ class AsyncpgStore:
 
     async def admin_events(self, view: str, product, topic, limit: int):
         clauses = {
-            "current": "status='CURRENT'",
+            "current": f"status='CURRENT' AND (memory_type IN {_OPERATIONAL_TYPES} OR event_type IN ('PRIORITY','BLOCKER','NEXT_ACTION','OPERATIONAL_STATE'))",
             "decisions": "memory_type='DECISION'",
             "policies": "(memory_type='POLICY' OR event_type='POLICY')",
             "agent_notes": "authority_level IN ('AGENT_ASSESSMENT','HYPOTHESIS')",
             "history": "status<>'CURRENT'",
-            "knowledge_vault": "memory_type IN ('RESEARCH','ARCHITECTURE_ASSESSMENT','DESIGN_PROPOSAL','EVIDENCE','TECHNICAL_RESULT','SESSION_SUMMARY')",
+            "knowledge_vault": f"status='CURRENT' AND memory_type IN {_ACTIVE_KNOWLEDGE_TYPES}",
         }
         return await self._events(clauses.get(view, "status='CURRENT'"), product, topic, None, limit)
 
@@ -216,4 +311,25 @@ def _record(row) -> dict[str, Any]:
     value["id"] = str(value["id"])
     if value.get("supersedes_id") is not None:
         value["supersedes_id"] = str(value["supersedes_id"])
+    return value
+
+
+def _source_record(row, *, include_content: bool = True) -> dict[str, Any]:
+    value = dict(row)
+    value["id"] = str(value["id"])
+    if isinstance(value.get("metadata"), str):
+        value["metadata"] = json.loads(value["metadata"])
+    if not include_content:
+        value.pop("content", None)
+    return value
+
+
+def _relation_record(row) -> dict[str, Any]:
+    value = dict(row)
+    value["id"] = str(value["id"])
+    if isinstance(value.get("metadata"), str):
+        value["metadata"] = json.loads(value["metadata"])
+    for key in ("from_event_id", "from_source_id", "to_event_id", "to_source_id"):
+        if value.get(key) is not None:
+            value[key] = str(value[key])
     return value

@@ -71,6 +71,14 @@ def create_router(*, service_url: str, owner_token: str, timeout_seconds: float,
     async def event_detail(event_id: UUID):
         return await call("GET", f"/v1/admin/events/{event_id}")
 
+    @router.get("/events/{event_id}/knowledge")
+    async def event_knowledge(event_id: UUID):
+        return await call("GET", f"/v1/admin/events/{event_id}/knowledge")
+
+    @router.get("/sources/{source_id}")
+    async def source_detail(source_id: UUID):
+        return await call("GET", f"/v1/admin/sources/{source_id}")
+
     @router.get("/policies")
     async def policies():
         return await call("GET", "/v1/admin/policies")
