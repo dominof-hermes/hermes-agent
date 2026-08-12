@@ -292,16 +292,35 @@
     const items = props.items || [];
     if (!items.length) return h("div", { className: "dm-empty" }, "No active policies.");
     return h("div", { className: "dm-cards" }, items.map(function (item) {
-      return h("article", { className: "dm-card", key: item.id },
+      return h("article", {
+        className: "dm-card dm-policy-card", key: item.id, role: "button", tabIndex: 0,
+        onClick: function () { props.onSelect(item); },
+        onKeyDown: function (event) { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); props.onSelect(item); } }
+      },
         h("dl", { className: "dm-detail-grid" },
           h("div", { className: "dm-detail-field wide" }, h("dt", null, "Title"), h("dd", null, item.title)),
+          h("div", { className: "dm-detail-field" }, h("dt", null, "Author"), h("dd", null, item.author || "Owner")),
+          h("div", { className: "dm-detail-field" }, h("dt", null, "Registered / Updated"),
+            h("dd", null, new Date(item.created_at).toLocaleString() + " / " + new Date(item.updated_at).toLocaleString()))
+        )
+      );
+    }));
+  }
+
+  function PolicyDetail(props) {
+    const item = props.item;
+    return h("div", { className: "dm-drawer-backdrop", onMouseDown: function (event) { if (event.target === event.currentTarget) props.onClose(); } },
+      h("aside", { className: "dm-drawer", role: "dialog", "aria-modal": "true", "aria-labelledby": "dm-policy-detail-title" },
+        h("header", { className: "dm-drawer-header" }, h("div", null,
+          h("span", { className: "dm-kicker" }, "POLICY"), h("h2", { id: "dm-policy-detail-title" }, item.title)),
+          h("button", { onClick: props.onClose }, "Close")),
+        h("dl", { className: "dm-detail-grid" },
           h("div", { className: "dm-detail-field" }, h("dt", null, "Author"), h("dd", null, item.author || "Owner")),
           h("div", { className: "dm-detail-field" }, h("dt", null, "Registered / Updated"),
             h("dd", null, new Date(item.created_at).toLocaleString() + " / " + new Date(item.updated_at).toLocaleString())),
           h("div", { className: "dm-detail-field wide dm-detail-content" }, h("dt", null, "Content"), h("dd", null, item.content))
         )
-      );
-    }));
+      ));
   }
 
   function PolicyComposer(props) {
@@ -368,6 +387,7 @@
     const [eventKnowledge, setEventKnowledge] = React.useState(null);
     const [eventKnowledgeStatus, setEventKnowledgeStatus] = React.useState("idle");
     const [selectedSource, setSelectedSource] = React.useState(null);
+    const [selectedPolicy, setSelectedPolicy] = React.useState(null);
     const [secret, setSecret] = React.useState(null);
     const [error, setError] = React.useState("");
     const [loading, setLoading] = React.useState(true);
@@ -617,7 +637,7 @@
     });
     else if (view === "Policies") body = h(React.Fragment, null,
       h(PolicyComposer, { onSubmit: createPolicy, busy: actionBusy }),
-      h(PolicyTable, { items: data.items })
+      h(PolicyTable, { items: data.items, onSelect: setSelectedPolicy })
     );
     else body = h(EventTable, { items: data.items, view: view, onSelect: openEvent, onSourceSelect: openSource, onDecision: decide });
 
@@ -640,7 +660,8 @@
         onSourceSelect: openSource,
         onClose: closeEvent
       }),
-      selectedSource && h(SourceDetail, { source: selectedSource, onClose: closeEvent })
+      selectedSource && h(SourceDetail, { source: selectedSource, onClose: closeEvent }),
+      selectedPolicy && h(PolicyDetail, { item: selectedPolicy, onClose: function () { setSelectedPolicy(null); } })
     );
   }
 

@@ -122,4 +122,6 @@
   border-color: rgba(36, 50, 77, 0.72);
   background: rgba(9, 13, 22, 0.5);
 }
+.dm-policy-card { cursor: pointer; transition: border-color 120ms ease, transform 120ms ease, box-shadow 120ms ease; }
+.dm-policy-card:hover, .dm-policy-card:focus-visible { outline: none; border-color: var(--color-ring); box-shadow: 0 0 0 1px var(--color-ring) inset; transform: translateY(-1px); }
 @media (max-width: 720px) { .dm-page { padding: 14px; } .dm-header { flex-direction: column; } .dm-drawer { width: 100%; padding: 16px; } .dm-drawer-header { top: -16px; margin: -16px -16px 16px; padding: 16px; } .dm-detail-grid { grid-template-columns: 1fr; } .dm-detail-field.wide { grid-column: auto; } }
