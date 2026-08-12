@@ -79,6 +79,18 @@ def create_router(*, service_url: str, owner_token: str, timeout_seconds: float,
     async def source_detail(source_id: UUID):
         return await call("GET", f"/v1/admin/sources/{source_id}")
 
+    @router.post("/decisions/{decision_id}/approve")
+    async def approve(decision_id: UUID, body: dict[str, Any] | None = None):
+        return await call("POST", f"/v1/admin/decisions/{decision_id}/approve", json=body or {})
+
+    @router.post("/decisions/{decision_id}/reject")
+    async def reject(decision_id: UUID, body: dict[str, Any] | None = None):
+        return await call("POST", f"/v1/admin/decisions/{decision_id}/reject", json=body or {})
+
+    @router.post("/policies")
+    async def create_policy(body: dict[str, Any]):
+        return await call("POST", "/v1/admin/policies", json=body)
+
     @router.get("/policies")
     async def policies():
         return await call("GET", "/v1/admin/policies")

@@ -114,7 +114,10 @@
         h("th", null, "Status"), h("th", null, "Effective / Occurred"), h("th", null, "Actor")
       )),
       h("tbody", null, items.map(function (item) {
-        function openDetail(event) { onSelect(item, event.currentTarget); }
+        function openDetail(event) {
+          if (item.item_kind === "SOURCE") props.onSourceSelect(item.id);
+          else onSelect(item, event.currentTarget);
+        }
         return h("tr", {
           key: item.id,
           className: "dm-event-row",
@@ -130,14 +133,18 @@
           }
         },
           h("td", null, h("strong", null, item.topic), h("small", null, item.product)),
-          h("td", null, h("strong", null, item.title), h("p", null, item.summary)),
-          h("td", null, item.memory_type + " · " + item.authority_level),
+          h("td", null, h("strong", null, item.title), h("p", null, item.summary || item.decision_content || item.content || "")),
+          h("td", null, (item.item_kind || item.memory_type || item.note_type || item.source_type || "RECORD") + " · " + (item.authority_level || "—")),
           h("td", null, h("span", { className: "dm-status" }, item.status)),
           h("td", null,
             h("strong", null, item.effective_from ? new Date(item.effective_from).toLocaleString() : "—"),
             h("small", null, "Occurred " + (item.occurred_at ? new Date(item.occurred_at).toLocaleString() : "—"))
           ),
-          h("td", null, item.actor)
+          h("td", null, item.actor || item.proposed_by || "Owner"),
+          props.view === "Decisions" && item.status === "PENDING_OWNER_CONFIRM" ? h("td", { className: "dm-actions" },
+            h("button", { onClick: function (event) { event.stopPropagation(); props.onDecision(item.id, "approve"); } }, "Approve"),
+            h("button", { className: "danger", onClick: function (event) { event.stopPropagation(); props.onDecision(item.id, "reject"); } }, "Reject")
+          ) : null
         );
       }))
     ));
@@ -297,12 +304,18 @@
     const onRevoke = props.onRevoke;
     const secret = props.secret;
     const busy = props.busy;
+    const [copied, setCopied] = React.useState("");
+    function copy(label, value) {
+      navigator.clipboard.writeText(value).then(function () { setCopied(label); });
+    }
     return h(React.Fragment, null,
       secret && h("section", { className: "dm-secret", role: "status" },
         h("strong", null, "Bootstrap key — shown once"),
         h("code", null, secret.bootstrap_key),
         h("p", null, "Expires: " + new Date(secret.expires_at).toLocaleString() + " · max uses: " + secret.max_uses),
-        h("button", { onClick: function () { navigator.clipboard.writeText(secret.bootstrap_key); } }, "Copy")
+        h("button", { onClick: function () { copy("key", secret.bootstrap_key); } }, "Copy Key"),
+        h("button", { onClick: function () { copy("command", "hermes memory bootstrap --agent " + secret.agent_id + " --key " + secret.bootstrap_key); } }, "Copy Start Command"),
+        copied && h("span", { role: "status" }, "Copied")
       ),
       h("div", { className: "dm-table-wrap" }, h("table", { className: "dm-table" },
         h("thead", null, h("tr", null, h("th", null, "Agent"), h("th", null, "Status"), h("th", null, "Last Access"), h("th", null, "Action"))),
@@ -465,7 +478,16 @@
       const listState = { view: view, scrollY: window.scrollY || 0 };
       window.history.replaceState({ dmMemoryList: listState }, "", "/memory");
       window.history.pushState({ dmMemoryDetail: true, dmMemoryList: listState }, "", eventPath(item.id));
-      setSelectedSource(null); setSelectedEvent(item); loadKnowledge(item);
+      const normalized = Object.assign({}, item, {
+        content: item.full_content || item.decision_content || item.content || item.summary,
+        memory_type: item.item_kind || item.memory_type || item.note_type || "CURRENT_CONTEXT",
+        event_type: item.note_type || item.item_kind || "RECORD",
+        actor: item.actor || item.proposed_by || "Owner",
+        created_at: item.stored_at || item.created_at
+      });
+      setSelectedSource(null); setSelectedEvent(normalized);
+      setEventKnowledge({ related_events: [], sources: [], relations: [], evidence_status: "insufficient_evidence" });
+      setEventKnowledgeStatus("ready");
     }
 
     function openRelatedEvent(eventId) {
@@ -547,12 +569,31 @@
       });
     }
 
+    function decide(decisionId, result) {
+      api("/decisions/" + encodeURIComponent(decisionId) + "/" + result, { method: "POST", body: JSON.stringify({}) })
+        .then(function () { load("Decisions"); })
+        .catch(function () { setError("Decision update unavailable."); });
+    }
+
+    function createPolicy() {
+      const title = window.prompt("Policy title");
+      if (!title) return;
+      const content = window.prompt("Policy content");
+      if (!content) return;
+      api("/policies", { method: "POST", body: JSON.stringify({ category: "GENERAL", title: title, content: content, scope: "GLOBAL", status: "ACTIVE" }) })
+        .then(function () { load("Policies"); })
+        .catch(function () { setError("Policy creation unavailable."); });
+    }
+
     let body;
     if (loading) body = h("div", { className: "dm-empty" }, "Loading bounded view…");
     else if (view === "Agent Access") body = h(AgentAccess, {
       items: data.items, secret: secret, busy: actionBusy, onRotate: rotate, onRevoke: revoke
     });
-    else body = h(EventTable, { items: data.items, onSelect: openEvent });
+    else body = h(React.Fragment, null,
+      view === "Policies" && h("button", { onClick: createPolicy }, "Create Policy"),
+      h(EventTable, { items: data.items, view: view, onSelect: openEvent, onSourceSelect: openSource, onDecision: decide })
+    );
 
     return h("main", { className: "dm-page" },
       h("header", { className: "dm-header" }, h("div", null,

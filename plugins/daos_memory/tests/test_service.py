@@ -239,6 +239,36 @@ class FakeStore:
         self.relations.append(row)
         return deepcopy(row)
 
+    async def write_decision(self, actor, values):
+        row = {**deepcopy(values), "id": str(uuid4()), "proposed_by": actor,
+               "stored_at": NOW, "status": "PENDING_OWNER_CONFIRM",
+               "authority_level": "AGENT_ASSESSMENT", "owner_comment": None, "approved_at": None}
+        self.events.append(row)
+        return deepcopy(row)
+
+    async def decide(self, decision_id, result, owner_comment):
+        row = next((item for item in self.events if item.get("id") == decision_id and item.get("status") == "PENDING_OWNER_CONFIRM"), None)
+        if not row:
+            return None
+        row.update(status=result, owner_comment=owner_comment,
+                   authority_level="OWNER_DECISION" if result == "APPROVED" else "AGENT_ASSESSMENT",
+                   approved_at=NOW if result == "APPROVED" else None)
+        return deepcopy(row)
+
+    async def write_policy(self, values):
+        version = 1 + max((item.get("version", 0) for item in self.policies
+                           if item.get("category") == values["category"] and item.get("title") == values["title"]), default=0)
+        row = {**deepcopy(values), "id": str(uuid4()), "version": version, "created_at": NOW, "updated_at": NOW}
+        self.policies.append(row)
+        return deepcopy(row)
+
+    async def write_current_context(self, actor, values):
+        row = {**deepcopy(values), "id": str(uuid4()), "actor": actor, "stored_at": NOW, "status": "CURRENT"}
+        return row
+
+    async def write_agent_note(self, actor, actor_role, values):
+        return {**deepcopy(values), "id": str(uuid4()), "actor": actor, "actor_role": actor_role, "stored_at": NOW}
+
 
 @pytest.fixture
 def store():
@@ -644,3 +674,28 @@ def test_owner_source_and_relation_writes_use_canonical_ids(client, store):
     assert relation.status_code == 201
     assert relation.json()["from_event_id"] == event_id
     assert relation.json()["to_source_id"] == source_id
+
+
+def test_agent_proposes_decision_and_owner_alone_can_approve(client, store):
+    token, _ = access(client)
+    proposed = client.post("/v1/decisions", headers={"Authorization": f"Bearer {token}"}, json={
+        "product": "DAOS", "topic": "memory", "title": "Keep repositories separate",
+        "decision_content": "Keep notes and raw sources separate.", "occurred_at": NOW.isoformat(),
+        "related_note_ids": [], "related_source_ids": [],
+    })
+    assert proposed.status_code == 201
+    assert proposed.json()["status"] == "PENDING_OWNER_CONFIRM"
+    decision_id = proposed.json()["id"]
+    assert client.post(f"/v1/admin/decisions/{decision_id}/approve", headers={"Authorization": f"Bearer {token}"}, json={}).status_code == 401
+    approved = client.post(f"/v1/admin/decisions/{decision_id}/approve", headers={"Authorization": "Bearer owner-secret"}, json={"owner_comment": "Approved"})
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "APPROVED"
+    assert approved.json()["authority_level"] == "OWNER_DECISION"
+
+
+def test_owner_alone_creates_policy(client):
+    payload = {"category": "WRITE_GUIDE", "title": "Writing", "content": "Write directly.", "scope": "GLOBAL", "status": "ACTIVE"}
+    assert client.post("/v1/admin/policies", json=payload).status_code == 401
+    created = client.post("/v1/admin/policies", headers={"Authorization": "Bearer owner-secret"}, json=payload)
+    assert created.status_code == 201
+    assert created.json()["version"] == 1

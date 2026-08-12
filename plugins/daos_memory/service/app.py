@@ -15,7 +15,10 @@ from fastapi.responses import JSONResponse
 
 from .auth import credential_matches, hash_credential, new_credential
 from .config import Settings
-from .models import BootstrapRequest, EventWrite, KnowledgeRelationWrite, RotateRequest, SourceWrite
+from .models import (
+    AgentNoteWrite, BootstrapRequest, CurrentContextWrite, DecisionAction, DecisionWrite,
+    EventWrite, KnowledgeRelationWrite, PolicyWrite, RotateRequest, SourceWrite,
+)
 
 _FORBIDDEN_QUERY_KEYS = {"key", "token", "access_token", "bootstrap_key", "owner_token"}
 _AGENT_AUTHORITIES = {"AGENT_ASSESSMENT", "HYPOTHESIS", "OPERATIONAL_STATE"}
@@ -91,10 +94,8 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
             active_knowledge = await bounded(store.read_active_knowledge(body.product, body.topic, min(settings.max_results, 5)))
         global_principles = [_compact_policy(p) for p in policies if p.get("category") == "GLOBAL"][:10]
         role_principles = [_compact_policy(p) for p in policies if p.get("category") != "GLOBAL"][:10]
-        decisions = [_compact_event(e) for e in events
-                     if e.get("memory_type") == "DECISION"
-                     and e.get("authority_level") in {"OWNER_DECISION", "VERIFIED_EVIDENCE"}][:5]
-        next_actions = [_compact_event(e) for e in operational if e.get("memory_type") == "NEXT_ACTION"][:5]
+        decisions = []
+        next_actions = [_compact_event(e) for e in operational if e.get("next_action")][:5]
         excluded = {e["id"] for e in decisions + next_actions}
         current = [_compact_event(e) for e in operational if str(e.get("id")) not in excluded][:10]
         payload = {
@@ -237,9 +238,39 @@ def create_app(*, settings: Settings, store: Any, clock: Callable[[], datetime] 
     async def admin_write_relation(body: KnowledgeRelationWrite):
         return await bounded(store.write_knowledge_relation(body.model_dump()))
 
+    @app.post("/v1/current-contexts", status_code=201)
+    async def write_current_context(body: CurrentContextWrite, agent: dict[str, Any] = Depends(agent_auth)):
+        return await bounded(store.write_current_context(agent["agent_id"], body.model_dump()))
+
+    @app.post("/v1/decisions", status_code=201)
+    async def propose_decision(body: DecisionWrite, agent: dict[str, Any] = Depends(agent_auth)):
+        return await bounded(store.write_decision(agent["agent_id"], body.model_dump()))
+
+    @app.post("/v1/agent-notes", status_code=201)
+    async def write_agent_note(body: AgentNoteWrite, agent: dict[str, Any] = Depends(agent_auth)):
+        return await bounded(store.write_agent_note(agent["agent_id"], agent["agent_id"].upper(), body.model_dump()))
+
+    @app.post("/v1/admin/decisions/{decision_id}/approve", dependencies=[Depends(owner_auth)])
+    async def approve_decision(decision_id: UUID, body: DecisionAction):
+        row = await bounded(store.decide(str(decision_id), "APPROVED", body.owner_comment))
+        if not row:
+            raise HTTPException(status_code=409, detail="decision is not pending")
+        return row
+
+    @app.post("/v1/admin/decisions/{decision_id}/reject", dependencies=[Depends(owner_auth)])
+    async def reject_decision(decision_id: UUID, body: DecisionAction):
+        row = await bounded(store.decide(str(decision_id), "REJECTED", body.owner_comment))
+        if not row:
+            raise HTTPException(status_code=409, detail="decision is not pending")
+        return row
+
+    @app.post("/v1/admin/policies", status_code=201, dependencies=[Depends(owner_auth)])
+    async def create_policy(body: PolicyWrite):
+        return await bounded(store.write_policy(body.model_dump()))
+
     @app.get("/v1/admin/policies", dependencies=[Depends(owner_auth)])
     async def admin_policies():
-        rows = await bounded(store.get_policies(["GLOBAL", "STRATEGY", "DEVELOPMENT", "EXECUTION", "RESEARCH", "MEMORY_WRITE"], settings.max_results))
+        rows = await bounded(store.admin_events("policies", None, None, settings.max_results))
         return {"items": rows, "count": len(rows)}
 
     return app
@@ -266,7 +297,7 @@ def _compact_event(event: dict[str, Any]) -> dict[str, Any]:
     keys = (
         "id", "created_at", "occurred_at", "effective_from", "effective_to",
         "source_session_at", "product", "topic", "memory_type", "event_type",
-        "title", "summary", "status", "authority_level", "actor", "work_id", "source_ref",
+        "title", "summary", "next_action", "status", "authority_level", "actor", "work_id", "source_ref",
     )
     compact = {key: event.get(key) for key in keys}
     compact["summary"] = str(compact.get("summary") or "")[:400]

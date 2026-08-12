@@ -110,22 +110,21 @@ class AsyncpgStore:
     async def get_policies(self, categories: list[str], limit: int):
         pool = await self._get_pool()
         rows = await pool.fetch(
-            """SELECT id, category, title, content, status, priority, updated_at
+            """SELECT id, category, title, content, scope, status, version, updated_at
             FROM daos_memory.canonical_policies WHERE status='ACTIVE' AND category=ANY($1::text[])
-            ORDER BY priority DESC, updated_at DESC LIMIT $2""",
+            ORDER BY updated_at DESC LIMIT $2""",
             categories, limit, timeout=self.timeout,
         )
         return [dict(r) for r in rows]
 
     async def read_current(self, product: str | None, topic: str | None, limit: int):
-        return await self._events("status='CURRENT'", product, topic, None, limit)
+        return await self.admin_events("current", product, topic, limit)
 
     async def read_operational_current(self, product: str | None, topic: str | None, limit: int):
-        clause = f"status='CURRENT' AND (memory_type IN {_OPERATIONAL_TYPES} OR event_type IN ('PRIORITY','BLOCKER','NEXT_ACTION','OPERATIONAL_STATE'))"
-        return await self._events(clause, product, topic, None, limit)
+        return await self.admin_events("current", product, topic, limit)
 
     async def read_active_knowledge(self, product: str | None, topic: str | None, limit: int):
-        return await self._events(f"status='CURRENT' AND memory_type IN {_ACTIVE_KNOWLEDGE_TYPES}", product, topic, None, limit)
+        return await self.admin_events("agent_notes", product, topic, limit)
 
     async def search_history(self, product: str | None, topic: str | None, query: str | None, limit: int):
         return await self._events("status<>'CURRENT'", product, topic, query, limit)
@@ -211,16 +210,17 @@ class AsyncpgStore:
         pool = await self._get_pool()
         source_id = str(uuid4())
         row = await pool.fetchrow(
-            f"""INSERT INTO daos_memory.knowledge_sources ({_SOURCE_COLUMNS}) VALUES
+            f"""INSERT INTO daos_memory.knowledge_sources ({_SOURCE_COLUMNS},product,topic,file_reference) VALUES
             ($1::uuid,$2,$3,$4,$5,$6::text[],$7,$8,$9,$10,$11::timestamptz,
-             $12::timestamptz,now(),$13,$14,$15,$16,$17,$18::jsonb)
+             $12::timestamptz,now(),$13,$14,$15,$16,$17,$18::jsonb,$19,$20,$21)
             RETURNING {_SOURCE_COLUMNS}""",
             source_id, source["source_type"], source["title"], source["source_interface"],
             source["actor"], source.get("participants") or [], source.get("repository"),
             source.get("path"), source.get("commit_sha"), source.get("source_url"),
             source["occurred_at"], source["source_session_at"], source["content"],
             source["content_hash"], source["access_scope"], source["security_level"],
-            source["redaction_status"], json.dumps(source.get("metadata") or {}), timeout=self.timeout,
+            source["redaction_status"], json.dumps(source.get("metadata") or {}),
+            source["product"], source["topic"], source.get("file_reference"), timeout=self.timeout,
         )
         return _source_record(row)
 
@@ -274,15 +274,66 @@ class AsyncpgStore:
         return [dict(r) for r in rows]
 
     async def admin_events(self, view: str, product, topic, limit: int):
-        clauses = {
-            "current": f"status='CURRENT' AND (memory_type IN {_OPERATIONAL_TYPES} OR event_type IN ('PRIORITY','BLOCKER','NEXT_ACTION','OPERATIONAL_STATE'))",
-            "decisions": "memory_type='DECISION'",
-            "policies": "(memory_type='POLICY' OR event_type='POLICY')",
-            "agent_notes": "authority_level IN ('AGENT_ASSESSMENT','HYPOTHESIS')",
-            "history": "status<>'CURRENT'",
-            "knowledge_vault": f"status='CURRENT' AND memory_type IN {_ACTIVE_KNOWLEDGE_TYPES}",
-        }
-        return await self._events(clauses.get(view, "status='CURRENT'"), product, topic, None, limit)
+        pool = await self._get_pool()
+        filters = "($1::text IS NULL OR product=$1) AND ($2::text IS NULL OR topic=$2)"
+        if view == "current":
+            sql, args = f"SELECT *, 'CURRENT_CONTEXT' AS item_kind FROM daos_memory.current_contexts WHERE status='CURRENT' AND {filters} ORDER BY occurred_at DESC,stored_at DESC LIMIT $3", (product, topic, limit)
+        elif view == "decisions":
+            sql, args = f"SELECT *, 'DECISION' AS item_kind FROM daos_memory.decisions WHERE {filters} ORDER BY occurred_at DESC,stored_at DESC LIMIT $3", (product, topic, limit)
+        elif view == "agent_notes":
+            sql, args = f"SELECT *, 'AGENT_NOTE' AS item_kind FROM daos_memory.agent_notes WHERE status='CURRENT' AND {filters} ORDER BY occurred_at DESC,stored_at DESC LIMIT $3", (product, topic, limit)
+        elif view == "knowledge_vault":
+            sql, args = f"SELECT id,source_type,title,source_interface,actor,participants,product,topic,occurred_at,imported_at,repository,path,commit_sha,content_hash,access_scope,security_level,'SOURCE' AS item_kind FROM daos_memory.knowledge_sources WHERE {filters} ORDER BY occurred_at DESC,imported_at DESC LIMIT $3", (product, topic, limit)
+        elif view == "policies":
+            sql, args = "SELECT *, 'POLICY' AS item_kind FROM daos_memory.canonical_policies ORDER BY updated_at DESC LIMIT $1", (limit,)
+        else:
+            sql, args = f"""SELECT * FROM (
+              SELECT id,product,topic,title,summary AS content,actor,occurred_at,stored_at,status,'CURRENT_CONTEXT' AS item_kind FROM daos_memory.current_contexts WHERE status<>'CURRENT'
+              UNION ALL SELECT id,product,topic,title,decision_content,proposed_by,occurred_at,stored_at,status,'DECISION' FROM daos_memory.decisions WHERE status IN ('REJECTED','SUPERSEDED')
+              UNION ALL SELECT id,product,topic,title,full_content,actor,occurred_at,stored_at,status,'AGENT_NOTE' FROM daos_memory.agent_notes WHERE status<>'CURRENT'
+            ) history WHERE {filters} ORDER BY occurred_at DESC,stored_at DESC LIMIT $3""", (product, topic, limit)
+        return [_json_record(row) for row in await pool.fetch(sql, *args, timeout=self.timeout)]
+
+    async def write_current_context(self, actor: str, values: dict[str, Any]):
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("UPDATE daos_memory.current_contexts SET status='SUPERSEDED' WHERE product=$1 AND topic=$2 AND status='CURRENT'", values["product"], values["topic"], timeout=self.timeout)
+                row = await conn.fetchrow("""INSERT INTO daos_memory.current_contexts
+                  (id,product,topic,title,summary,next_action,actor,occurred_at,related_note_ids,related_decision_ids)
+                  VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9::uuid[],$10::uuid[]) RETURNING *""",
+                  str(uuid4()), values["product"], values["topic"], values["title"], values["summary"], values["next_action"], actor, values["occurred_at"], values.get("related_note_ids", []), values.get("related_decision_ids", []), timeout=self.timeout)
+        return _json_record(row)
+
+    async def write_decision(self, actor: str, values: dict[str, Any]):
+        pool = await self._get_pool()
+        row = await pool.fetchrow("""INSERT INTO daos_memory.decisions
+          (id,product,topic,title,decision_content,proposed_by,occurred_at,supersedes_id,related_note_ids,related_source_ids)
+          VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8::uuid,$9::uuid[],$10::uuid[]) RETURNING *""",
+          str(uuid4()), values["product"], values["topic"], values["title"], values["decision_content"], actor, values["occurred_at"], values.get("supersedes_id"), values.get("related_note_ids", []), values.get("related_source_ids", []), timeout=self.timeout)
+        return _json_record(row)
+
+    async def decide(self, decision_id: str, result: str, owner_comment: str | None):
+        pool = await self._get_pool()
+        row = await pool.fetchrow("""UPDATE daos_memory.decisions SET status=$2,
+          authority_level=CASE WHEN $2='APPROVED' THEN 'OWNER_DECISION' ELSE 'AGENT_ASSESSMENT' END,
+          owner_comment=$3,approved_at=CASE WHEN $2='APPROVED' THEN now() ELSE NULL END
+          WHERE id=$1::uuid AND status='PENDING_OWNER_CONFIRM' RETURNING *""", decision_id, result, owner_comment, timeout=self.timeout)
+        return _json_record(row) if row else None
+
+    async def write_policy(self, values: dict[str, Any]):
+        pool = await self._get_pool()
+        version = await pool.fetchval("SELECT COALESCE(max(version),0)+1 FROM daos_memory.canonical_policies WHERE category=$1 AND title=$2", values["category"], values["title"], timeout=self.timeout)
+        row = await pool.fetchrow("INSERT INTO daos_memory.canonical_policies(id,category,title,content,scope,status,version) VALUES($1::uuid,$2,$3,$4,$5,$6,$7) RETURNING *", str(uuid4()), values["category"], values["title"], values["content"], values["scope"], values["status"], version, timeout=self.timeout)
+        return _json_record(row)
+
+    async def write_agent_note(self, actor: str, actor_role: str, values: dict[str, Any]):
+        pool = await self._get_pool()
+        row = await pool.fetchrow("""INSERT INTO daos_memory.agent_notes
+          (id,actor,actor_role,product,topic,note_type,title,summary,full_content,occurred_at,status,related_source_ids,related_note_ids,access_scope,security_level)
+          VALUES($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::uuid[],$13::uuid[],$14,$15) RETURNING *""",
+          str(uuid4()),actor,actor_role,values["product"],values["topic"],values["note_type"],values["title"],values["summary"],values["full_content"],values["occurred_at"],values["status"],values.get("related_source_ids",[]),values.get("related_note_ids",[]),values["access_scope"],values["security_level"],timeout=self.timeout)
+        return _json_record(row)
 
 
 async def _insert_event(conn, event: dict[str, Any], timeout: float) -> dict[str, Any]:
@@ -321,6 +372,18 @@ def _source_record(row, *, include_content: bool = True) -> dict[str, Any]:
         value["metadata"] = json.loads(value["metadata"])
     if not include_content:
         value.pop("content", None)
+    return value
+
+
+def _json_record(row) -> dict[str, Any]:
+    value = dict(row)
+    if value.get("id") is not None:
+        value["id"] = str(value["id"])
+    for key, item in list(value.items()):
+        if isinstance(item, UUID):
+            value[key] = str(item)
+        elif isinstance(item, list):
+            value[key] = [str(part) if isinstance(part, UUID) else part for part in item]
     return value
 
 

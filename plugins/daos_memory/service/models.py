@@ -28,14 +28,20 @@ MemoryType = Literal[
     "DETAIL_NOTE",
 ]
 SourceType = Literal[
-    "CHAT_CONVERSATION", "SLACK_THREAD", "GIT_MD", "ARCHITECTURE", "ADR",
-    "RUNBOOK", "INCIDENT", "EVIDENCE", "ATTACHMENT", "ENGINEERING_NOTE",
+    "CHAT_CONVERSATION", "SLACK_THREAD", "GIT_MD", "PDF", "ARCHITECTURE_DOCUMENT",
+    "RUNBOOK", "ADR", "EVIDENCE", "ATTACHMENT", "ENGINEERING_DOCUMENT",
 ]
 RelationType = Literal[
     "SUMMARIZES", "DERIVED_FROM", "SOURCE_OF", "RELATED_TO", "SUPERSEDES",
     "EVIDENCE_FOR", "DECIDED_BY", "IMPLEMENTED_BY",
 ]
-_GIT_SOURCE_TYPES = {"GIT_MD", "ARCHITECTURE", "ADR", "RUNBOOK", "ENGINEERING_NOTE"}
+DecisionStatus = Literal["PENDING_OWNER_CONFIRM", "APPROVED", "REJECTED", "SUPERSEDED"]
+NoteType = Literal[
+    "STRATEGY", "ASSESSMENT", "ARCHITECTURE", "ENGINEERING_KNOWLEDGE",
+    "EXECUTION_REPORT", "RESEARCH", "MARKET_INTELLIGENCE", "IMPLEMENTATION_NOTE",
+    "INCIDENT_LEARNING",
+]
+_GIT_SOURCE_TYPES = {"GIT_MD", "ARCHITECTURE_DOCUMENT", "ADR", "RUNBOOK", "ENGINEERING_DOCUMENT"}
 _CREDENTIAL_PATTERN = re.compile(
     r"(?i)(?:authorization\s*:\s*bearer\s+\S+|"
     r"(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*\S+|"
@@ -103,6 +109,8 @@ class EventWrite(BaseModel):
 
 class SourceWrite(BaseModel):
     source_type: SourceType
+    product: str = Field(min_length=1, max_length=120)
+    topic: str = Field(min_length=1, max_length=160)
     title: str = Field(min_length=1, max_length=240)
     source_interface: str = Field(min_length=1, max_length=80)
     actor: str = Field(min_length=1, max_length=80)
@@ -111,6 +119,7 @@ class SourceWrite(BaseModel):
     path: str | None = Field(default=None, max_length=1000)
     commit_sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{40,64}$")
     source_url: str | None = Field(default=None, max_length=1000)
+    file_reference: str | None = Field(default=None, max_length=1000)
     occurred_at: AwareDatetime
     source_session_at: AwareDatetime
     content: str = Field(min_length=1, max_length=524288)
@@ -179,3 +188,52 @@ class KnowledgeRelationWrite(BaseModel):
 class RotateRequest(BaseModel):
     max_uses: int | None = Field(default=None, ge=1, le=5)
     ttl_seconds: int | None = Field(default=None, ge=30, le=3600)
+
+
+class CurrentContextWrite(BaseModel):
+    product: str = Field(min_length=1, max_length=120)
+    topic: str = Field(min_length=1, max_length=160)
+    title: str = Field(min_length=1, max_length=240)
+    summary: str = Field(min_length=1, max_length=1200)
+    next_action: str = Field(min_length=1, max_length=1200)
+    occurred_at: AwareDatetime
+    related_note_ids: list[UUID] = Field(default_factory=list, max_length=32)
+    related_decision_ids: list[UUID] = Field(default_factory=list, max_length=32)
+
+
+class DecisionWrite(BaseModel):
+    product: str = Field(min_length=1, max_length=120)
+    topic: str = Field(min_length=1, max_length=160)
+    title: str = Field(min_length=1, max_length=240)
+    decision_content: str = Field(min_length=1, max_length=8000)
+    occurred_at: AwareDatetime
+    related_note_ids: list[UUID] = Field(default_factory=list, max_length=32)
+    related_source_ids: list[UUID] = Field(default_factory=list, max_length=32)
+    supersedes_id: UUID | None = None
+
+
+class DecisionAction(BaseModel):
+    owner_comment: str | None = Field(default=None, max_length=1200)
+
+
+class PolicyWrite(BaseModel):
+    category: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=240)
+    content: str = Field(min_length=1, max_length=8000)
+    scope: str = Field(min_length=1, max_length=160)
+    status: Literal["DRAFT", "ACTIVE", "SUPERSEDED"] = "ACTIVE"
+
+
+class AgentNoteWrite(BaseModel):
+    product: str = Field(min_length=1, max_length=120)
+    topic: str = Field(min_length=1, max_length=160)
+    note_type: NoteType
+    title: str = Field(min_length=1, max_length=240)
+    summary: str = Field(min_length=1, max_length=1200)
+    full_content: str = Field(min_length=1, max_length=16000)
+    occurred_at: AwareDatetime
+    status: Literal["CURRENT", "CLOSED", "HISTORICAL", "SUPERSEDED"] = "CURRENT"
+    related_source_ids: list[UUID] = Field(default_factory=list, max_length=32)
+    related_note_ids: list[UUID] = Field(default_factory=list, max_length=32)
+    access_scope: Literal["OWNER", "COMPANY", "PRODUCT", "RESTRICTED"]
+    security_level: Literal["INTERNAL", "RESTRICTED"]

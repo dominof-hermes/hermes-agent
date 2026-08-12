@@ -128,6 +128,26 @@ def test_dashboard_artifacts_define_top_level_memory_views():
     assert "owner-secret" not in script
 
 
+def test_repository_semantics_migration_is_simple_destructive_and_preserves_agent_access():
+    sql = (ROOT / "migrations" / "004_repository_semantics.sql").read_text().lower()
+    for table in ("current_contexts", "decisions", "agent_notes", "canonical_policies"):
+        assert f"daos_memory.{table}" in sql
+    assert "pending_owner_confirm" in sql
+    assert "approved" in sql and "rejected" in sql and "superseded" in sql
+    assert "truncate table" in sql
+    assert "agent_registry" not in sql.split("truncate table", 1)[1].split(";", 1)[0]
+    assert "vector" not in sql and "embedding" not in sql
+
+
+def test_dashboard_has_owner_decision_policy_and_copy_contracts():
+    script = (ROOT / "dashboard" / "dist" / "index.js").read_text()
+    for label in ("Approve", "Reject", "Create Policy", "Copy Key", "Copy Start Command", "Copied"):
+        assert label in script
+    assert "/decisions/" in script
+    assert "/policies" in script
+    assert "Auto-generate" not in script
+
+
 def test_event_rows_open_one_shared_read_only_detail_drawer_with_full_content():
     script = (ROOT / "dashboard" / "dist" / "index.js").read_text()
     style = (ROOT / "dashboard" / "dist" / "style.css").read_text()
