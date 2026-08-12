@@ -42,4 +42,84 @@
 .dm-knowledge-section > a { display: block; border: 1px solid var(--border, var(--ui-stroke-secondary)); border-radius: 7px; padding: 10px 12px; color: var(--accent, var(--ui-accent)); text-decoration: none; }
 .dm-knowledge-section > a:hover, .dm-knowledge-section > a:focus-visible { text-decoration: underline; }
 .dm-relation { display: flex; justify-content: space-between; gap: 12px; border: 1px solid var(--border, var(--ui-stroke-secondary)); border-radius: 7px; padding: 9px 11px; overflow-wrap: anywhere; }
+
+/* Policies follows the exact visual language of KANBAN > Usage. */
+.dm-policy-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  margin-bottom: 1rem;
+  padding: 1.1rem 1.25rem;
+  color: #f1f5f9;
+  border: 1px solid #24324d;
+  border-radius: 0.85rem;
+  background: linear-gradient(145deg, #0b1220, #111a2b);
+  overflow: hidden;
+}
+.dm-policy-composer h2 {
+  margin: -1.1rem -1.25rem 0;
+  padding: 1.1rem 1.25rem;
+  border-bottom: 1px solid #24324d;
+  font-size: 1.2rem;
+  font-weight: 750;
+}
+.dm-policy-composer label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  color: #93a9c4;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.dm-policy-composer input,
+.dm-policy-composer textarea {
+  box-sizing: border-box;
+  width: 100%;
+  color: #f1f5f9;
+  border: 1px solid #24324d;
+  border-radius: var(--radius-sm, 0.25rem);
+  background: #0b1220;
+  padding: 0.75rem 0.85rem;
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+.dm-policy-composer input[name="title"] { min-height: 3rem; }
+.dm-policy-composer textarea[name="content"] {
+  min-height: 14rem;
+  resize: vertical;
+}
+.dm-policy-composer input[readonly] {
+  color: #93a9c4;
+  background: rgba(9, 13, 22, 0.5);
+}
+.dm-policy-composer input:focus,
+.dm-policy-composer textarea:focus {
+  outline: none;
+  border-color: var(--color-ring);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-ring) 30%, transparent);
+}
+.dm-policy-composer button[type="submit"] {
+  align-self: flex-end;
+  min-width: 7.5rem;
+  border: 1px solid #24324d;
+  background: rgba(9, 13, 22, 0.5);
+  color: #f1f5f9;
+  font-weight: 700;
+}
+.dm-policy-composer button[type="submit"]:hover:not(:disabled) {
+  border-color: var(--color-ring);
+  background: color-mix(in srgb, var(--color-ring) 16%, #0b1220);
+}
+.dm-policy-composer + .dm-cards .dm-card {
+  color: #f1f5f9;
+  border: 1px solid #24324d;
+  border-radius: 0.85rem;
+  background: linear-gradient(145deg, #0b1220, #111a2b);
+}
+.dm-policy-composer + .dm-cards .dm-detail-field {
+  border-color: rgba(36, 50, 77, 0.72);
+  background: rgba(9, 13, 22, 0.5);
+}
 @media (max-width: 720px) { .dm-page { padding: 14px; } .dm-header { flex-direction: column; } .dm-drawer { width: 100%; padding: 16px; } .dm-drawer-header { top: -16px; margin: -16px -16px 16px; padding: 16px; } .dm-detail-grid { grid-template-columns: 1fr; } .dm-detail-field.wide { grid-column: auto; } }
