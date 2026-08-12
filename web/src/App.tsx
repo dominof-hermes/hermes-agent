@@ -281,6 +281,11 @@ function partitionSidebarNav(
   return { coreItems, pluginItems };
 }
 
+function pluginRoutePath(path: string): string {
+  const base = path.replace(/\/+$/, "") || "/";
+  return base === "/" ? "/*" : `${base}/*`;
+}
+
 function buildRoutes(
   builtinRoutes: Record<string, ComponentType>,
   manifests: PluginManifest[],
@@ -325,7 +330,7 @@ function buildRoutes(
     if (builtinRoutes[m.tab.path]) continue;
     routes.push({
       key: `plugin:${m.name}`,
-      path: m.tab.path,
+      path: pluginRoutePath(m.tab.path),
       element: <PluginPage name={m.name} />,
     });
   }
@@ -336,7 +341,7 @@ function buildRoutes(
     if (builtinRoutes[m.tab.path] || m.tab.override) continue;
     routes.push({
       key: `plugin:hidden:${m.name}`,
-      path: m.tab.path,
+      path: pluginRoutePath(m.tab.path),
       element: <PluginPage name={m.name} />,
     });
   }

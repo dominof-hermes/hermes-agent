@@ -430,3 +430,9 @@ def test_wheel_package_data_declares_only_daos_runtime_artifacts():
         "daos_memory/requirements.txt",
     ):
         assert artifact in plugin_data
+
+
+def test_shell_plugin_routes_keep_nested_canonical_urls_mounted():
+    app_source = (ROOT.parents[1] / "web" / "src" / "App.tsx").read_text(encoding="utf-8")
+    assert "function pluginRoutePath(path: string)" in app_source
+    assert app_source.count("path: pluginRoutePath(m.tab.path)") == 2
