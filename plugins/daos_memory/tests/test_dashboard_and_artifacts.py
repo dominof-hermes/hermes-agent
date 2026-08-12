@@ -333,6 +333,8 @@ def test_source_grounded_knowledge_migration_is_additive_and_canonical():
         assert relation in sql
     assert "references daos_memory.context_events" in sql
     assert "references daos_memory.knowledge_sources" in sql
+    assert "grant select, insert on daos_memory.knowledge_sources, daos_memory.knowledge_relations to daos_memory_runtime" in sql
+    assert "grant update" not in sql and "grant delete" not in sql
     assert "drop table" not in sql and "delete from" not in sql and "update daos_memory.context_events" not in sql
 
 

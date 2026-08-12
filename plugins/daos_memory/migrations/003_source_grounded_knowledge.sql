@@ -68,4 +68,12 @@ CREATE INDEX knowledge_relations_to_event_idx ON daos_memory.knowledge_relations
 CREATE INDEX knowledge_relations_from_source_idx ON daos_memory.knowledge_relations (from_source_id) WHERE from_source_id IS NOT NULL;
 CREATE INDEX knowledge_relations_to_source_idx ON daos_memory.knowledge_relations (to_source_id) WHERE to_source_id IS NOT NULL;
 
+DO $grant_runtime$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'daos_memory_runtime') THEN
+        EXECUTE 'GRANT SELECT, INSERT ON daos_memory.knowledge_sources, daos_memory.knowledge_relations TO daos_memory_runtime';
+    END IF;
+END
+$grant_runtime$;
+
 COMMIT;
