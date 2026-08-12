@@ -436,3 +436,13 @@ def test_shell_plugin_routes_keep_nested_canonical_urls_mounted():
     app_source = (ROOT.parents[1] / "web" / "src" / "App.tsx").read_text(encoding="utf-8")
     assert "function pluginRoutePath(path: string)" in app_source
     assert app_source.count("path: pluginRoutePath(m.tab.path)") == 2
+
+
+def test_dockerfile_restores_built_web_dist_after_source_copy():
+    dockerfile = (ROOT.parents[1] / "Dockerfile").read_text(encoding="utf-8")
+    preserve = "cp -a hermes_cli/web_dist /tmp/hermes_web_dist"
+    source_copy = "COPY --link --chmod=a+rX,go-w . ."
+    restore = "mv /tmp/hermes_web_dist hermes_cli/web_dist"
+    assert preserve in dockerfile
+    assert restore in dockerfile
+    assert dockerfile.index(preserve) < dockerfile.index(source_copy) < dockerfile.index(restore)

@@ -191,7 +191,8 @@ COPY web/ web/
 COPY ui-tui/ ui-tui/
 COPY apps/shared/ apps/shared/
 RUN cd web && npm run build && \
-    cd ../ui-tui && npm run build
+    cd ../ui-tui && npm run build && \
+    cd .. && cp -a hermes_cli/web_dist /tmp/hermes_web_dist
 
 # ---------- Source code ----------
 # .dockerignore excludes node_modules, so the installs above survive.
@@ -202,6 +203,7 @@ RUN cd web && npm run build && \
 # gives the non-root hermes user read + traverse but no write; root retains
 # write so the build steps below don't need chmod u+w dances.
 COPY --link --chmod=a+rX,go-w . .
+RUN rm -rf hermes_cli/web_dist && mv /tmp/hermes_web_dist hermes_cli/web_dist
 
 # ---------- Permissions ----------
 # Link hermes-agent itself (editable). Deps are already installed in the
